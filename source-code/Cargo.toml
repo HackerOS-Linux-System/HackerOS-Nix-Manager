@@ -1,1 +1,23 @@
+[package]
+name = "hnm"
+version = "0.0.1"
+edition = "2021"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+description = "HackerOS Nix Manager — lightweight Nix package manager for HackerOS"
+license = "Apache-2.0"
 
+[[bin]]
+name = "hnm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "color"] }
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+colored = "2"
+indicatif = "0.17"
+dirs = "5"
+toml = "0.8"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
