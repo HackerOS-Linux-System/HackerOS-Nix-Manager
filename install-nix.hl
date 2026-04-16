@@ -1,0 +1,13 @@
+;; 1. Instalacja Nix (single-user, bez daemona — lekka jak flox)
+> sh <(curl -L https://nixos.org/nix/install) --no-daemon
+
+;; 2. Załaduj środowisko (lub dodaj do .bashrc / .zshrc)
+> . ~/.nix-profile/etc/profile.d/nix.sh
+
+;; 3. Dodaj kanał nixpkgs
+> nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs
+> nix-channel --update
+
+;; 4. Sprawdź
+> nix --version
+> nix-env --version
