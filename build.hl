@@ -1,0 +1,5 @@
+// cargo
+
+> cd source-code
+> cargo build --release
+;; if you dont have install nix: > hl run install-nix.hl
