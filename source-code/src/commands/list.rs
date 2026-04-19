@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crate::{nix, output, state};
 
-pub fn run(installed_only: bool, json: bool) -> Result<()> {
+pub fn run(_installed_only: bool, json: bool) -> Result<()> {
     nix::ensure_nix()?;
 
     let pkgs = state::list()?;
