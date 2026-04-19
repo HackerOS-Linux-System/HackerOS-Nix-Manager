@@ -3,10 +3,11 @@ mod commands;
 mod config;
 mod nix;
 mod output;
+mod pkgdb;
 mod progress;
 mod state;
 
-use cli::{Command, Opts};
+use cli::Command;
 
 fn main() {
     let opts = match cli::parse() {
