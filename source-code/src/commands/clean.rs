@@ -5,9 +5,9 @@ use crate::{config, output};
 pub fn run() -> Result<()> {
     output::header("Clean HNM cache");
 
-    let data_dir = config::data_dir();
+    let _data_dir = config::data_dir();
     let cache_dir = config::home().join(".cache").join("hnm");
-    let nix_cache  = config::home().join(".cache").join("nix");
+    let _nix_cache = config::home().join(".cache").join("nix");
 
     let mut freed = 0u64;
 
