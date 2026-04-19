@@ -1,68 +1,44 @@
-/// HNM progress display
-///
-/// Layout:
-///
-///   │ log line 1 ...
-///   │ log line 2 ...
-///   │ log line 3 ...
-///   / [████████████────────────] 55%  resolving dependencies
-///
-/// Spinner chars: / - \ |
-/// Bar style:     ████░░░░ in bright_cyan
-
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const SPINNER_CHARS: [&str; 4] = ["/", "-", "\\", "|"];
 
-/// Build a progress bar with the HNM style.
-/// `total` = number of steps (use 0 for indeterminate).
 pub fn make_bar(total: u64, label: &str) -> ProgressBar {
     let bar = if total == 0 {
         ProgressBar::new_spinner()
     } else {
         ProgressBar::new(total)
     };
-
     let style = ProgressStyle::with_template(
         "  {spinner:.cyan}  {bar:40.cyan/black}  {percent:>3}%  {msg:.bright_cyan}",
     )
     .unwrap()
     .tick_strings(&SPINNER_CHARS)
     .progress_chars("█▉▊▋▌▍▎▏ ");
-
     bar.set_style(style);
     bar.set_message(label.to_string());
     bar.enable_steady_tick(Duration::from_millis(120));
     bar
 }
 
-/// A scrolling log panel + one progress bar underneath.
-/// Call `.log(msg)` to append log lines, `.set_msg(msg)` to update the action label,
-/// `.inc(n)` to advance the bar, `.finish_ok(msg)` / `.finish_err(msg)` to complete.
 pub struct TaskProgress {
     bar: ProgressBar,
-    logs: Arc<Mutex<Vec<String>>>,
+    _logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl TaskProgress {
     pub fn new(total: u64, label: &str) -> Self {
-        let bar = make_bar(total, label);
         Self {
-            bar,
-            logs: Arc::new(Mutex::new(Vec::new())),
+            bar: make_bar(total, label),
+            _logs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Print a log line above the bar.
     pub fn log(&self, msg: &str) {
-        // Print above the bar using println! — indicatif will redraw bar below
         self.bar.println(format!("  {} {}", "│".cyan().dimmed(), msg.dimmed()));
-        if let Ok(mut v) = self.logs.lock() {
-            v.push(msg.to_string());
-        }
     }
 
     pub fn warn(&self, msg: &str) {
@@ -89,10 +65,6 @@ impl TaskProgress {
         self.bar.inc(delta);
     }
 
-    pub fn set_pos(&self, pos: u64) {
-        self.bar.set_position(pos);
-    }
-
     pub fn finish_ok(&self, msg: &str) {
         self.bar.set_style(
             ProgressStyle::with_template(
@@ -116,28 +88,21 @@ impl TaskProgress {
         );
         self.bar.abandon_with_message(format!("✗ {}", msg));
     }
-
-    pub fn abandon(&self) {
-        self.bar.abandon();
-    }
 }
 
-/// Run a subprocess and stream its stdout/stderr as log lines into a TaskProgress.
-/// Returns Ok(exit_success) or Err.
-pub fn run_with_log(
+/// Run a pre-built Command, streaming stdout+stderr as log lines.
+/// Returns Ok(true) if exit code 0, Ok(false) otherwise.
+pub fn run_cmd_log(
     task: &TaskProgress,
-    cmd: &str,
-    args: &[&str],
+    mut cmd: std::process::Command,
 ) -> anyhow::Result<bool> {
     use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
 
-    let mut child = Command::new(cmd)
-    .args(args)
+    let mut child = cmd
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()
-    .map_err(|e| anyhow::anyhow!("failed to spawn '{}': {}", cmd, e))?;
+    .map_err(|e| anyhow::anyhow!("failed to spawn process: {}", e))?;
 
     // Stream stdout
     if let Some(stdout) = child.stdout.take() {
@@ -147,15 +112,53 @@ pub fn run_with_log(
             }
         }
     }
-    // Stream stderr
+    // Stream stderr — distinguish errors from info
     if let Some(stderr) = child.stderr.take() {
         for line in BufReader::new(stderr).lines() {
             if let Ok(l) = line {
-                task.err_line(&l);
+                let lc = l.to_lowercase();
+                if lc.contains("error:") || lc.starts_with("error") {
+                    task.err_line(&l);
+                } else {
+                    task.log(&l);
+                }
             }
         }
     }
 
     let status = child.wait()?;
     Ok(status.success())
+}
+
+/// Convenience: run a shell string with env vars.
+pub fn run_shell_log_env(
+    task: &TaskProgress,
+    shell_cmd: &str,
+    env_vars: &[(String, String)],
+) -> anyhow::Result<bool> {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", shell_cmd])
+    .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    run_cmd_log(task, cmd)
+}
+
+/// Compatibility shim used by unpack.rs and others.
+pub fn run_with_log_env(
+    task: &TaskProgress,
+    program: &str,
+    args: &[&str],
+    env_vars: &[(String, String)],
+) -> anyhow::Result<bool> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+    .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    run_cmd_log(task, cmd)
+}
+
+pub fn run_with_log(
+    task: &TaskProgress,
+    program: &str,
+    args: &[&str],
+) -> anyhow::Result<bool> {
+    run_with_log_env(task, program, args, &[])
 }
