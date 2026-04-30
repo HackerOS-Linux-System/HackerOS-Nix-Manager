@@ -9,15 +9,15 @@ use owo_colors::OwoColorize;
 
 pub fn error(msg: &str) {
     eprintln!("{} {}",
-              " ERROR ".red().bold().underline(),
-              msg.red().bold().underline(),
+        " ERROR ".red().bold().underline(),
+        msg.red().bold().underline(),
     );
 }
 
 pub fn warn(msg: &str) {
     eprintln!("{} {}",
-              " WARN ".yellow().underline(),
-              msg.yellow().underline(),
+        " WARN ".yellow().underline(),
+        msg.yellow().underline(),
     );
 }
 
@@ -48,8 +48,8 @@ pub fn table_header() {
     println!(
         "  {:<32}  {:<14}  {}",
         "PACKAGE".cyan().bold().underline().to_string(),
-             "VERSION".cyan().bold().underline().to_string(),
-             "DESCRIPTION".cyan().bold().underline().to_string(),
+        "VERSION".cyan().bold().underline().to_string(),
+        "DESCRIPTION".cyan().bold().underline().to_string(),
     );
     println!("  {}", "─".repeat(80).cyan().dimmed());
 }
@@ -61,8 +61,8 @@ pub fn table_row(name: &str, version: &str, desc: &str, is_installed: bool) {
     println!(
         "  {:<32}  {:<14}  {}",
         full_name.bright_cyan().bold(),
-             version.cyan(),
-             short_desc.dimmed(),
+        version.cyan(),
+        short_desc.dimmed(),
     );
 }
 
@@ -82,20 +82,20 @@ pub fn version() {
     println!();
 
     let nix_ver = std::process::Command::new("nix")
-    .arg("--version")
-    .output()
-    .ok()
-    .and_then(|o| String::from_utf8(o.stdout).ok())
-    .map(|s| s.trim().to_string())
-    .unwrap_or_else(|| "not installed".into());
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "not installed".into());
 
     let nix_env_ver = std::process::Command::new("nix-env")
-    .arg("--version")
-    .output()
-    .ok()
-    .and_then(|o| String::from_utf8(o.stdout).ok())
-    .map(|s| s.trim().to_string())
-    .unwrap_or_else(|| "not installed".into());
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "not installed".into());
 
     label("nix", &nix_ver);
     label("nix-env", &nix_env_ver);
