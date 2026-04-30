@@ -23,8 +23,8 @@ pub fn run(_installed_only: bool, json: bool) -> Result<()> {
     output::table_header();
     for pkg in &pkgs {
         let pin = pkg.pinned.as_ref()
-        .map(|v| format!(" [pinned: {}]", v))
-        .unwrap_or_default();
+            .map(|v| format!(" [pinned: {}]", v))
+            .unwrap_or_default();
         let name  = format!("{}{}", pkg.name, pin);
         let desc  = pkg.description.as_deref().unwrap_or("");
         output::table_row(&name, &pkg.version, desc, true);
