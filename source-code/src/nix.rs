@@ -19,8 +19,8 @@ pub struct Pkg {
 
 pub fn nix_ok() -> bool {
     Command::new("nix-env").arg("--version")
-    .stdout(Stdio::null()).stderr(Stdio::null())
-    .status().map(|s| s.success()).unwrap_or(false)
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
 }
 
 pub fn ensure_nix() -> Result<()> {
@@ -44,8 +44,8 @@ pub fn pub_nix_env_vars() -> Vec<(String, String)> {
     let new_path = format!(
         "{}:{}:{}",
         nix_profile_bin.display(),
-                           nix_default_bin.display(),
-                           cur_path,
+        nix_default_bin.display(),
+        cur_path,
     );
 
     // NIX_PATH: where nix-env -iA nixpkgs.X resolves nixpkgs
@@ -81,22 +81,22 @@ fn nix_env_vars() -> Vec<(String, String)> {
 fn memory_wrapper() -> Option<(String, Vec<String>)> {
     // Check if systemd-run is available
     let ok = Command::new("systemd-run")
-    .args(["--version"])
-    .stdout(Stdio::null()).stderr(Stdio::null())
-    .status().map(|s| s.success()).unwrap_or(false);
+        .args(["--version"])
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false);
     if !ok { return None; }
 
     // Use --scope (not --service) so it runs in current session,
     // MemoryMax=2G hard limit, MemorySwapMax=0 disables swap growth
     Some((
         "systemd-run".into(),
-          vec![
-              "--scope".into(),
-          "--user".into(),
-          "-p".into(), "MemoryMax=2G".into(),
-          "-p".into(), "MemorySwapMax=512M".into(),
-          "--".into(),
-          ],
+        vec![
+            "--scope".into(),
+            "--user".into(),
+            "-p".into(), "MemoryMax=2G".into(),
+            "-p".into(), "MemorySwapMax=512M".into(),
+            "--".into(),
+        ],
     ))
 }
 
@@ -157,7 +157,7 @@ pub fn search(query: &str, task: &progress::TaskProgress) -> Result<Vec<Pkg>> {
     task.set_msg(&format!("searching {} packages", count));
 
     let results = pkgdb::search(query)
-    .with_context(|| "failed to search local package index")?;
+        .with_context(|| "failed to search local package index")?;
 
     let pkgs: Vec<Pkg> = results.into_iter().map(|(attr, name, version): (String, String, String)| {
         let short = attr.strip_prefix("nixpkgs.").unwrap_or(&attr).to_string();
@@ -166,8 +166,8 @@ pub fn search(query: &str, task: &progress::TaskProgress) -> Result<Vec<Pkg>> {
             version,
             attr_path:   attr,
             description: String::new(),
-                                                 homepage:    None,
-                                                 license:     None,
+            homepage:    None,
+            license:     None,
         }
     }).collect();
 
@@ -228,7 +228,7 @@ pub fn install(bare_name: &str, task: &progress::TaskProgress) -> Result<()> {
 
     let attr = format!("nixpkgs.{}", bare_name);
     task.log(&format!("nix-env --profile {} -iA {}  [GC_INITIAL_HEAP_SIZE=64M]",
-                      profile.display(), attr));
+        profile.display(), attr));
 
     let profile_str = profile.to_str().unwrap().to_string();
     let ok = progress::run_cmd_log(
@@ -239,8 +239,8 @@ pub fn install(bare_name: &str, task: &progress::TaskProgress) -> Result<()> {
     if !ok {
         return Err(anyhow!(
             "nix-env -iA {} failed — check that the package name is correct.\n  \
-Tip: run `hnm search {}` first to find the exact attribute path",
-attr, bare_name
+             Tip: run `hnm search {}` first to find the exact attribute path",
+            attr, bare_name
         ));
     }
     Ok(())
@@ -270,9 +270,9 @@ pub fn update_channel(task: &progress::TaskProgress) -> Result<()> {
     let cfg = config::load()?;
     task.log(&format!("nix-channel --add {} nixpkgs", cfg.nix_channel));
     let _ = Command::new("nix-channel")
-    .args(["--add", &cfg.nix_channel, "nixpkgs"])
-    .envs(nix_env_vars())
-    .status();
+        .args(["--add", &cfg.nix_channel, "nixpkgs"])
+        .envs(nix_env_vars())
+        .status();
 
     task.set_msg("nix-channel --update");
     task.log("nix-channel --update");
@@ -313,10 +313,10 @@ pub fn info(name: &str) -> Result<Pkg> {
 
     // nix-env --query --available -A nixpkgs.steam --json
     let out = Command::new("nix-env")
-    .args(["--query", "--available", "-A", &attr, "--json"])
-    .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-    .output()
-    .with_context(|| format!("cannot query info for '{name}'"))?;
+        .args(["--query", "--available", "-A", &attr, "--json"])
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .with_context(|| format!("cannot query info for '{name}'"))?;
 
     if out.status.success() && !out.stdout.is_empty() {
         let raw = String::from_utf8_lossy(&out.stdout);
@@ -325,16 +325,16 @@ pub fn info(name: &str) -> Result<Pkg> {
                 if let Some((attr_key, info)) = obj.iter().next() {
                     return Ok(Pkg {
                         name: info["pname"].as_str()
-                        .or_else(|| info["name"].as_str())
-                        .unwrap_or(name).to_string(),
-                              version: info["version"].as_str().unwrap_or("?").to_string(),
-                              attr_path: attr_key.clone(),
-                              description: info["meta"]["description"].as_str()
-                              .or_else(|| info["description"].as_str())
-                              .unwrap_or("").to_string(),
-                              homepage: info["meta"]["homepage"].as_str().map(String::from),
-                              license: info["meta"]["license"]["spdxId"].as_str()
-                              .or_else(|| info["meta"]["license"].as_str()).map(String::from),
+                            .or_else(|| info["name"].as_str())
+                            .unwrap_or(name).to_string(),
+                        version: info["version"].as_str().unwrap_or("?").to_string(),
+                        attr_path: attr_key.clone(),
+                        description: info["meta"]["description"].as_str()
+                            .or_else(|| info["description"].as_str())
+                            .unwrap_or("").to_string(),
+                        homepage: info["meta"]["homepage"].as_str().map(String::from),
+                        license: info["meta"]["license"]["spdxId"].as_str()
+                            .or_else(|| info["meta"]["license"].as_str()).map(String::from),
                     });
                 }
             }
@@ -349,28 +349,28 @@ pub fn info(name: &str) -> Result<Pkg> {
 pub fn list_profile() -> Result<Vec<Pkg>> {
     let profile = config::profile_dir();
     let out = Command::new("nix-env")
-    .args(["--profile", profile.to_str().unwrap(),
-          "--query", "--installed", "--json"])
-    .envs(nix_env_vars())
-    .output()
-    .with_context(|| "cannot query nix-env profile")?;
+        .args(["--profile", profile.to_str().unwrap(),
+               "--query", "--installed", "--json"])
+        .envs(nix_env_vars())
+        .output()
+        .with_context(|| "cannot query nix-env profile")?;
 
     if !out.status.success() { return Ok(vec![]); }
     let raw = String::from_utf8_lossy(&out.stdout);
     if raw.trim().is_empty() || raw.trim() == "{}" { return Ok(vec![]); }
 
     let v: serde_json::Value = serde_json::from_str(&raw)
-    .unwrap_or(serde_json::json!({}));
+        .unwrap_or(serde_json::json!({}));
     let mut pkgs = Vec::new();
     if let Some(obj) = v.as_object() {
         for (name, info) in obj {
             pkgs.push(Pkg {
                 name: name.clone(),
-                      version: info["version"].as_str().unwrap_or("?").into(),
-                      attr_path: name.clone(),
-                      description: info["meta"]["description"].as_str()
-                      .or_else(|| info["description"].as_str()).unwrap_or("").into(),
-                      homepage: None, license: None,
+                version: info["version"].as_str().unwrap_or("?").into(),
+                attr_path: name.clone(),
+                description: info["meta"]["description"].as_str()
+                    .or_else(|| info["description"].as_str()).unwrap_or("").into(),
+                homepage: None, license: None,
             });
         }
     }
@@ -394,10 +394,10 @@ pub fn gc(task: &progress::TaskProgress) -> Result<()> {
 pub fn list_generations() -> Result<Vec<(u32, String, bool)>> {
     let profile = config::profile_dir();
     let out = Command::new("nix-env")
-    .args(["--profile", profile.to_str().unwrap(), "--list-generations"])
-    .envs(nix_env_vars())
-    .output()
-    .with_context(|| "cannot list generations")?;
+        .args(["--profile", profile.to_str().unwrap(), "--list-generations"])
+        .envs(nix_env_vars())
+        .output()
+        .with_context(|| "cannot list generations")?;
     let raw = String::from_utf8_lossy(&out.stdout);
     let mut gens = Vec::new();
     for line in raw.lines() {
@@ -428,7 +428,7 @@ pub fn switch_generation(gen: u32, task: &progress::TaskProgress) -> Result<()> 
 
 pub fn store_du() -> String {
     Command::new("du").args(["-sh", "/nix/store"]).output().ok()
-    .and_then(|o| String::from_utf8(o.stdout).ok())
-    .map(|s| s.split_whitespace().next().unwrap_or("?").to_string())
-    .unwrap_or_else(|| "?".into())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.split_whitespace().next().unwrap_or("?").to_string())
+        .unwrap_or_else(|| "?".into())
 }
