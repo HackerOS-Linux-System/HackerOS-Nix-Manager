@@ -1,6 +1,6 @@
 [package]
 name = "hnm"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 description = "HackerOS Nix Manager — lightweight Nix package manager for HackerOS"
@@ -20,4 +20,5 @@ toml         = "0.8"
 anyhow       = "1"
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "5"
+libc         = "0.2"
 reqwest      = { version = "0.11", features = ["blocking"], optional = true }
