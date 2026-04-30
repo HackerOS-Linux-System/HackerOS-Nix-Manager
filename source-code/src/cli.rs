@@ -145,7 +145,7 @@ pub fn parse() -> Result<Opts> {
         "rollback" => {
             let generation = match parser.next()? {
                 Some(Value(v)) => Some(v.string()?.parse::<u32>()
-                .map_err(|_| anyhow!("generation must be a number"))?),
+                    .map_err(|_| anyhow!("generation must be a number"))?),
                 None => None,
                 Some(arg) => return Err(anyhow!(arg.unexpected())),
             };
