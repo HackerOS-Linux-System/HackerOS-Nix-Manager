@@ -29,7 +29,7 @@ pub fn run(package: &str) -> Result<()> {
                 ));
                 output::dim("The package may provide binaries under different names.");
                 output::dim(&format!("Check: ls {}",
-                                     profile.join("bin").display()));
+                    profile.join("bin").display()));
             } else {
                 return Err(anyhow!("'{}' is not installed — run `hnm install {}`", package, package));
             }
