@@ -13,8 +13,8 @@ pub fn run(package: &str, version: Option<&str>) -> Result<()> {
         None => {
             // Use the currently installed version
             state::get(package)
-            .map(|p| p.version)
-            .unwrap_or_else(|| "?".to_string())
+                .map(|p| p.version)
+                .unwrap_or_else(|| "?".to_string())
         }
     };
 
