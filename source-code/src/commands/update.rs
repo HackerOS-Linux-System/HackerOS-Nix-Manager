@@ -24,7 +24,7 @@ pub fn run(packages: Option<&[String]>) -> Result<()> {
 
         let result = pkgdb::rebuild_db(
             |msg| task.log(msg),
-                                       |msg| task.err_line(msg),
+            |msg| task.err_line(msg),
         );
 
         match result {
@@ -49,14 +49,14 @@ pub fn run(packages: Option<&[String]>) -> Result<()> {
     } else {
         let to_upgrade: Vec<state::InstalledPkg> = match packages {
             Some(explicit) => tracked
-            .into_iter()
-            .filter(|p| explicit.iter().any(|e| *e == p.name))
-            .collect(),
+                .into_iter()
+                .filter(|p| explicit.iter().any(|e| *e == p.name))
+                .collect(),
             None => tracked.into_iter().collect(),
         };
 
         let (pinned, to_upgrade): (Vec<state::InstalledPkg>, Vec<state::InstalledPkg>) =
-        to_upgrade.into_iter().partition(|p| p.pinned.is_some());
+            to_upgrade.into_iter().partition(|p| p.pinned.is_some());
 
         for p in &pinned {
             output::warn(&format!(
@@ -68,7 +68,7 @@ pub fn run(packages: Option<&[String]>) -> Result<()> {
         if !to_upgrade.is_empty() {
             output::info(&format!(
                 "upgrading {} package(s) one at a time...",
-                                  to_upgrade.len()
+                to_upgrade.len()
             ));
             println!();
 
@@ -79,7 +79,7 @@ pub fn run(packages: Option<&[String]>) -> Result<()> {
             for (idx, pkg) in to_upgrade.iter().enumerate() {
                 output::step(
                     &format!("{}/{}", idx + 1, total),
-                             &format!("upgrading  {}", pkg.name),
+                    &format!("upgrading  {}", pkg.name),
                 );
                 let task = progress::TaskProgress::new(100, &format!("nix-env -uA nixpkgs.{}", pkg.name));
                 let result = nix::upgrade_one(&pkg.name, &task);
