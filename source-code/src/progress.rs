@@ -45,7 +45,7 @@ impl TaskProgress {
         self.bar.println(format!(
             "  {} {}",
             "│ WARN".yellow().underline(),
-                                 msg.yellow().underline()
+            msg.yellow().underline()
         ));
     }
 
@@ -53,7 +53,7 @@ impl TaskProgress {
         self.bar.println(format!(
             "  {} {}",
             "│ ERR ".red().bold().underline(),
-                                 msg.red().bold().underline()
+            msg.red().bold().underline()
         ));
     }
 
@@ -99,10 +99,10 @@ pub fn run_cmd_log(
     use std::io::{BufRead, BufReader};
 
     let mut child = cmd
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .map_err(|e| anyhow::anyhow!("failed to spawn process: {}", e))?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn process: {}", e))?;
 
     // Stream stdout
     if let Some(stdout) = child.stdout.take() {
@@ -138,7 +138,7 @@ pub fn run_shell_log_env(
 ) -> anyhow::Result<bool> {
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-c", shell_cmd])
-    .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     run_cmd_log(task, cmd)
 }
 
@@ -151,7 +151,7 @@ pub fn run_with_log_env(
 ) -> anyhow::Result<bool> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
-    .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        .envs(env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     run_cmd_log(task, cmd)
 }
 
