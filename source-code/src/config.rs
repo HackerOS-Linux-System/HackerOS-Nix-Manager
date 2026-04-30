@@ -46,7 +46,7 @@ pub fn load() -> Result<HnmConfig> {
         return Ok(cfg);
     }
     let raw = fs::read_to_string(&path)
-    .with_context(|| format!("cannot read config: {:?}", path))?;
+        .with_context(|| format!("cannot read config: {:?}", path))?;
     toml::from_str(&raw).with_context(|| "invalid config.toml")
 }
 
