@@ -17,7 +17,7 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
         println!();
         output::step(
             &format!("{}/{}", idx + 1, packages.len()),
-                     &format!("installing  {}", pkg_name),
+            &format!("installing  {}", pkg_name),
         );
 
         if state::is_installed(pkg_name) {
@@ -26,10 +26,10 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
         }
 
         let bare = pkg_name
-        .strip_prefix("nixpkgs.")
-        .or_else(|| pkg_name.strip_prefix("nixpkgs#"))
-        .unwrap_or(pkg_name)
-        .to_string();
+            .strip_prefix("nixpkgs.")
+            .or_else(|| pkg_name.strip_prefix("nixpkgs#"))
+            .unwrap_or(pkg_name)
+            .to_string();
 
         let task = progress::TaskProgress::new(100, &format!("nix-env -iA nixpkgs.{}", bare));
         task.log(&format!("nix-env -iA nixpkgs.{}  [NIXPKGS_ALLOW_UNFREE=1]", bare));
@@ -41,8 +41,8 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
         match result {
             Ok(_) => {
                 let version = nix::info(&bare)
-                .map(|p| p.version)
-                .unwrap_or_else(|_| "?".into());
+                    .map(|p| p.version)
+                    .unwrap_or_else(|_| "?".into());
 
                 let pkg = state::InstalledPkg {
                     name:         pkg_name.clone(),
@@ -90,9 +90,9 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
         // Quick check — if default nix profile has the binary, mention it
         for pkg_name in packages {
             let bare = pkg_name
-            .strip_prefix("nixpkgs.")
-            .or_else(|| pkg_name.strip_prefix("nixpkgs#"))
-            .unwrap_or(pkg_name);
+                .strip_prefix("nixpkgs.")
+                .or_else(|| pkg_name.strip_prefix("nixpkgs#"))
+                .unwrap_or(pkg_name);
             let in_hnm_profile   = profile_bin.join(bare).exists();
             let in_default_profile = default_bin.join(bare).exists();
             if in_hnm_profile {
