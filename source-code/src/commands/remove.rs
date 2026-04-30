@@ -14,7 +14,7 @@ pub fn run(packages: &[String], _force: bool) -> Result<()> {
         println!();
         output::step(
             &format!("{}/{}", idx + 1, packages.len()),
-                     &format!("removing  {}", pkg_name),
+            &format!("removing  {}", pkg_name),
         );
 
         if !state::is_installed(pkg_name) {
