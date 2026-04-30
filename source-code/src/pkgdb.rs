@@ -15,7 +15,7 @@ pub fn search(query: &str) -> Result<Vec<(String, String, String)>> {
         return Ok(vec![]);
     }
     let file = fs::File::open(&path)
-    .with_context(|| format!("cannot open pkgdb at {:?}", path))?;
+        .with_context(|| format!("cannot open pkgdb at {:?}", path))?;
     let reader = BufReader::new(file);
     let q = query.to_lowercase();
     let mut results = Vec::new();
@@ -56,7 +56,7 @@ pub fn entry_count() -> usize {
 /// Streams nix-env -qaP output line-by-line into TSV — O(1) RAM.
 pub fn rebuild_db(
     log:  impl Fn(&str),
-                  elog: impl Fn(&str),
+    elog: impl Fn(&str),
 ) -> Result<usize> {
     use std::process::{Command, Stdio};
 
@@ -90,23 +90,23 @@ pub fn rebuild_db(
     log(&format!("writing to {}", tmp_path.display()));
 
     let mut child = Command::new("nix-env")
-    .args(["-qaP"])
-    .env("PATH",                 &new_path)
-    .env("NIX_PATH",             &nix_path)
-    .env("NIX_DEFEXPR",          &defexpr)
-    .env("NIXPKGS_ALLOW_UNFREE", "1")
-    .env("GC_INITIAL_HEAP_SIZE", "67108864")
-    .env("GC_MAXIMUM_HEAP_SIZE", "838860800")
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())   // ← show errors so we can debug
-    .spawn()
-    .with_context(|| "failed to spawn nix-env -qaP")?;
+        .args(["-qaP"])
+        .env("PATH",                 &new_path)
+        .env("NIX_PATH",             &nix_path)
+        .env("NIX_DEFEXPR",          &defexpr)
+        .env("NIXPKGS_ALLOW_UNFREE", "1")
+        .env("GC_INITIAL_HEAP_SIZE", "67108864")
+        .env("GC_MAXIMUM_HEAP_SIZE", "838860800")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())   // ← show errors so we can debug
+        .spawn()
+        .with_context(|| "failed to spawn nix-env -qaP")?;
 
     // Drain stderr in a thread so it doesn't block stdout
     let stderr_handle = {
         let stderr = child.stderr.take().unwrap();
         let elog_lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let capture = elog_lines.clone();
         let handle = std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
@@ -122,7 +122,7 @@ pub fn rebuild_db(
     let reader = BufReader::new(stdout);
 
     let mut out = fs::File::create(&tmp_path)
-    .with_context(|| format!("cannot create {:?}", tmp_path))?;
+        .with_context(|| format!("cannot create {:?}", tmp_path))?;
 
     let mut count = 0usize;
     for line in reader.lines() {
@@ -164,15 +164,15 @@ pub fn rebuild_db(
         let channels_exists = channels_nixpkgs.exists();
         return Err(anyhow::anyhow!(
             "nix-env -qaP produced no output.\n  \
-NIX_DEFEXPR exists: {defexpr_exists}  (~/.nix-defexpr)\n  \
-channels/nixpkgs:   {channels_exists}  (~/.nix-defexpr/channels/nixpkgs)\n  \
-Fix: run `hnm unpack` to register the nixpkgs channel, then `hnm update` again."
+             NIX_DEFEXPR exists: {defexpr_exists}  (~/.nix-defexpr)\n  \
+             channels/nixpkgs:   {channels_exists}  (~/.nix-defexpr/channels/nixpkgs)\n  \
+             Fix: run `hnm unpack` to register the nixpkgs channel, then `hnm update` again."
         ));
     }
 
     // Atomically replace old db
     fs::rename(&tmp_path, &path)
-    .with_context(|| "failed to rename tmp pkgdb")?;
+        .with_context(|| "failed to rename tmp pkgdb")?;
 
     log(&format!("package index built: {} packages", count));
     Ok(count)
