@@ -3,13 +3,23 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use crate::config::{data_dir, home};
+use crate::util::split_name_version;
 
 pub fn db_path() -> PathBuf {
     data_dir().join("pkgdb.tsv")
 }
 
+/// One row of the local index.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub attr: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+}
+
 /// Search the local cache. Fast, zero RAM.
-pub fn search(query: &str) -> Result<Vec<(String, String, String)>> {
+pub fn search(query: &str) -> Result<Vec<Entry>> {
     let path = db_path();
     if !path.exists() {
         return Ok(vec![]);
@@ -21,15 +31,50 @@ pub fn search(query: &str) -> Result<Vec<(String, String, String)>> {
     let mut results = Vec::new();
     for line in reader.lines() {
         let line = match line { Ok(l) => l, Err(_) => continue };
-        let mut parts = line.splitn(3, '\t');
-        let attr    = parts.next().unwrap_or("").to_string();
-        let name    = parts.next().unwrap_or("").to_string();
-        let version = parts.next().unwrap_or("").to_string();
-        if attr.to_lowercase().contains(&q) || name.to_lowercase().contains(&q) {
-            results.push((attr, name, version));
+        let entry = parse_row(&line);
+        if entry.attr.to_lowercase().contains(&q)
+            || entry.name.to_lowercase().contains(&q)
+            || entry.description.to_lowercase().contains(&q)
+        {
+            results.push(entry);
         }
     }
     Ok(results)
+}
+
+/// Return every entry in the index, in file order. Used by `hnm list`
+/// (no `-i`/`--installed` flag) to show the full package catalog — see
+/// commands/list.rs and docs/hnm.html#changelog (v0.2). `limit = None`
+/// returns everything.
+pub fn all(limit: Option<usize>) -> Result<Vec<Entry>> {
+    let path = db_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let file = fs::File::open(&path)
+        .with_context(|| format!("cannot open pkgdb at {:?}", path))?;
+    let reader = BufReader::new(file);
+    let mut results = Vec::new();
+    for line in reader.lines() {
+        let line = match line { Ok(l) => l, Err(_) => continue };
+        results.push(parse_row(&line));
+        if let Some(n) = limit {
+            if results.len() >= n {
+                break;
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn parse_row(line: &str) -> Entry {
+    let mut parts = line.splitn(4, '\t');
+    Entry {
+        attr:        parts.next().unwrap_or("").to_string(),
+        name:        parts.next().unwrap_or("").to_string(),
+        version:     parts.next().unwrap_or("").to_string(),
+        description: parts.next().unwrap_or("").to_string(),
+    }
 }
 
 pub fn is_fresh() -> bool {
@@ -53,7 +98,7 @@ pub fn entry_count() -> usize {
 }
 
 /// Rebuild the package database.
-/// Streams nix-env -qaP output line-by-line into TSV — O(1) RAM.
+/// Streams `nix-env -qaP --description` line-by-line into TSV — O(1) RAM.
 pub fn rebuild_db(
     log:  impl Fn(&str),
     elog: impl Fn(&str),
@@ -83,14 +128,18 @@ pub fn rebuild_db(
         format!("{}", channels_dir.display())
     };
 
+    // --description appends a third whitespace-separated field to each
+    // line: `attrPath  name-version  description text here...`. We still
+    // only need splitn(3, whitespace) to pull it apart correctly since
+    // the description is always last.
     log(&format!(
-        "nix-env -qaP  [NIX_DEFEXPR={}, NIX_PATH={}]",
+        "nix-env -qaP --description  [NIX_DEFEXPR={}, NIX_PATH={}]",
         defexpr.display(), nix_path
     ));
     log(&format!("writing to {}", tmp_path.display()));
 
     let mut child = Command::new("nix-env")
-        .args(["-qaP"])
+        .args(["-qaP", "--description"])
         .env("PATH",                 &new_path)
         .env("NIX_PATH",             &nix_path)
         .env("NIX_DEFEXPR",          &defexpr)
@@ -100,7 +149,7 @@ pub fn rebuild_db(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())   // ← show errors so we can debug
         .spawn()
-        .with_context(|| "failed to spawn nix-env -qaP")?;
+        .with_context(|| "failed to spawn nix-env -qaP --description")?;
 
     // Drain stderr in a thread so it doesn't block stdout
     let stderr_handle = {
@@ -127,15 +176,20 @@ pub fn rebuild_db(
     let mut count = 0usize;
     for line in reader.lines() {
         let line = match line { Ok(l) => l, Err(_) => continue };
-        let line = line.trim().to_string();
+        let line = line.trim_end();
         if line.is_empty() { continue; }
 
-        let mut cols  = line.splitn(2, char::is_whitespace);
-        let attr      = cols.next().unwrap_or("").trim();
-        let name_ver  = cols.next().unwrap_or("").trim();
+        let mut cols       = line.splitn(3, char::is_whitespace);
+        let attr           = cols.next().unwrap_or("").trim();
+        let name_ver       = cols.next().unwrap_or("").trim();
+        let description    = cols.next().unwrap_or("").trim();
         let (name, version) = split_name_version(name_ver);
 
-        writeln!(out, "{}\t{}\t{}", attr, name, version)?;
+        // Descriptions must not contain tabs/newlines or they'd corrupt
+        // the TSV — collapse any stray whitespace to single spaces.
+        let description: String = description.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        writeln!(out, "{}\t{}\t{}\t{}", attr, name, version, description)?;
         count += 1;
         if count % 5000 == 0 {
             log(&format!("  indexed {} packages...", count));
@@ -176,19 +230,4 @@ pub fn rebuild_db(
 
     log(&format!("package index built: {} packages", count));
     Ok(count)
-}
-
-fn split_name_version(s: &str) -> (String, String) {
-    let bytes = s.as_bytes();
-    let mut split_at = None;
-    for i in (1..bytes.len()).rev() {
-        if bytes[i - 1] == b'-' && bytes[i].is_ascii_digit() {
-            split_at = Some(i - 1);
-            break;
-        }
-    }
-    match split_at {
-        Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
-        None    => (s.to_string(), String::new()),
-    }
 }
