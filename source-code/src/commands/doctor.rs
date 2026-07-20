@@ -53,7 +53,29 @@ pub fn run() -> Result<()> {
     // ── State / config ────────────────────────────────────────────────────────
     println!();
     match state::load() {
-        Ok(st) => output::ok(&format!("state      {} package(s) tracked", st.installed.len())),
+        Ok(st) => {
+            output::ok(&format!("state      {} package(s) tracked", st.installed.len()));
+
+            // Read-only drift check between state.json and the real
+            // nix-env profile — state used to never notice this at all.
+            // See docs/hnm.html#changelog (v0.2). `hnm list -i` and
+            // `hnm rollback` actually fix the drift; doctor just reports it.
+            if let Ok(profile_pkgs) = nix::list_profile() {
+                let profile_names: std::collections::HashSet<&str> =
+                    profile_pkgs.iter().map(|p| p.name.as_str()).collect();
+                let tracked_names: std::collections::HashSet<&str> =
+                    st.installed.keys().map(|s| s.as_str()).collect();
+                let missing_from_state = profile_names.difference(&tracked_names).count();
+                let stale_in_state = tracked_names.difference(&profile_names).count();
+                if missing_from_state > 0 || stale_in_state > 0 {
+                    output::warn(&format!(
+                        "state drift: {} untracked in profile, {} stale in state.json  →  run `hnm list -i`",
+                        missing_from_state, stale_in_state
+                    ));
+                    warnings += 1;
+                }
+            }
+        }
         Err(e) => {
             output::warn(&format!("state file corrupt: {}", e));
             warnings += 1;
