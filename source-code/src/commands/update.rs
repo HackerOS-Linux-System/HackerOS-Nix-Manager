@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use crate::{nix, output, pkgdb, progress, state};
+use crate::{config, nix, output, pkgdb, progress, state};
 
 pub fn run(packages: Option<&[String]>) -> Result<()> {
     nix::ensure_nix()?;
@@ -114,6 +114,32 @@ pub fn run(packages: Option<&[String]>) -> Result<()> {
     let mut st = state::load()?;
     st.last_update = Some(Utc::now());
     state::save(&st)?;
+
+    if let Some(gen) = nix::current_generation() {
+        let _ = state::set_generation(gen);
+    }
+
+    // config.hk's `auto_gc` / `max_generations` — previously parsed and
+    // never actually used anywhere. See docs/hnm.html#config and
+    // #changelog (v0.2).
+    if let Ok(cfg) = config::load() {
+        if cfg.max_generations > 0 {
+            let task = progress::TaskProgress::new(1, "pruning old generations");
+            if let Ok(n) = nix::prune_old_generations(cfg.max_generations, &task) {
+                if n > 0 {
+                    output::dim(&format!(
+                        "pruned {} old generation(s) (max_generations = {})",
+                        n, cfg.max_generations
+                    ));
+                }
+            }
+        }
+        if cfg.auto_gc {
+            output::info("auto_gc is enabled in config.hk — running `hnm gc`...");
+            let task = progress::TaskProgress::new(100, "nix-store --gc");
+            let _ = nix::gc(&task);
+        }
+    }
 
     println!();
     output::ok("HNM is up to date");
