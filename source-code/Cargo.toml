@@ -1,7 +1,11 @@
 [package]
 name = "hnm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+# hk-parser (config.hk support) pulls in clap 4.6.x, whose newest patch
+# releases require edition2024 manifests — so building `hnm` needs a
+# reasonably current toolchain even though our own code stays edition2021.
+rust-version = "1.85"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 description = "HackerOS Nix Manager — lightweight Nix package manager for HackerOS"
 license = "Apache-2.0"
@@ -16,9 +20,12 @@ owo-colors   = { version = "4", features = ["supports-colors"] }
 indicatif    = "0.17"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
-toml         = "0.8"
 anyhow       = "1"
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "5"
 libc         = "0.2"
-reqwest      = { version = "0.11", features = ["blocking"], optional = true }
+
+# .hk config format (replaces the old TOML config, see docs/hnm.html#config)
+# https://crates.io/crates/hk-parser · https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+hk-parser    = "0.3.1"
+indexmap     = "2"
