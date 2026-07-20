@@ -81,3 +81,75 @@ pub fn unpin(name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+// ─── generation tracking ───────────────────────────────────────────────────
+//
+// `State.generation` used to be declared and never written anywhere — see
+// docs/hnm.html#changelog (v0.2). It's now kept in sync with the real
+// nix-env profile generation after every operation that creates one
+// (install / remove / update / rollback).
+
+pub fn set_generation(gen: u32) -> Result<()> {
+    let mut st = load()?;
+    st.generation = gen;
+    save(&st)
+}
+
+// ─── syncing with the real Nix profile ─────────────────────────────────────
+//
+// HNM tracks installed packages in its own state.json, separate from
+// `nix-env`'s profile. That can drift: a package installed manually with
+// `nix-env` won't show up in `hnm list`, and — more importantly — a
+// `hnm rollback` switches the underlying profile generation without
+// touching state.json, so the tracked package list can go stale. See
+// docs/hnm.html#changelog (v0.2).
+//
+// `sync_from_profile` reconciles state.installed against the packages
+// nix-env actually reports as installed right now:
+//   - packages present in the profile but missing from state are added
+//     (best-effort metadata: install time = now, no pin, no description)
+//   - packages tracked in state but no longer present in the profile are
+//     dropped
+//
+// Existing tracked packages that are still installed keep their original
+// metadata (install timestamp, pin, description) untouched.
+pub fn sync_from_profile(profile_pkgs: &[crate::nix::Pkg]) -> Result<(usize, usize)> {
+    let mut st = load()?;
+
+    let profile_names: std::collections::HashSet<&str> =
+        profile_pkgs.iter().map(|p| p.name.as_str()).collect();
+
+    // Drop anything HNM thinks is installed but the profile disagrees with.
+    let before = st.installed.len();
+    st.installed.retain(|name, _| profile_names.contains(name.as_str()));
+    let removed = before - st.installed.len();
+
+    // Add anything the profile has that HNM doesn't know about yet.
+    let mut added = 0usize;
+    for pkg in profile_pkgs {
+        if !st.installed.contains_key(&pkg.name) {
+            st.installed.insert(
+                pkg.name.clone(),
+                InstalledPkg {
+                    name: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    attr_path: pkg.attr_path.clone(),
+                    installed_at: Utc::now(),
+                    pinned: None,
+                    description: if pkg.description.is_empty() {
+                        None
+                    } else {
+                        Some(pkg.description.clone())
+                    },
+                },
+            );
+            added += 1;
+        }
+    }
+
+    if added > 0 || removed > 0 {
+        save(&st)?;
+    }
+
+    Ok((added, removed))
+}
