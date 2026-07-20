@@ -159,13 +159,18 @@ pub fn search(query: &str, task: &progress::TaskProgress) -> Result<Vec<Pkg>> {
     let results = pkgdb::search(query)
         .with_context(|| "failed to search local package index")?;
 
-    let pkgs: Vec<Pkg> = results.into_iter().map(|(attr, name, version): (String, String, String)| {
-        let short = attr.strip_prefix("nixpkgs.").unwrap_or(&attr).to_string();
+    // As of v0.2 the local index (pkgdb.tsv) also stores a description
+    // column — see pkgdb::rebuild_db — so `hnm search` no longer has to
+    // leave the description blank the way it used to (docs/hnm.html
+    // #changelog). `hnm info <pkg>` still does a live nix-env query for
+    // homepage/license, which the bulk index doesn't carry.
+    let pkgs: Vec<Pkg> = results.into_iter().map(|entry: pkgdb::Entry| {
+        let short = entry.attr.strip_prefix("nixpkgs.").unwrap_or(&entry.attr).to_string();
         Pkg {
             name:        short,
-            version,
-            attr_path:   attr,
-            description: String::new(),
+            version:     entry.version,
+            attr_path:   entry.attr,
+            description: entry.description,
             homepage:    None,
             license:     None,
         }
@@ -174,21 +179,6 @@ pub fn search(query: &str, task: &progress::TaskProgress) -> Result<Vec<Pkg>> {
     task.inc(100);
     Ok(pkgs)
 }
-fn split_name_version(s: &str) -> (String, String) {
-    let bytes = s.as_bytes();
-    let mut split_at = None;
-    for i in (1..bytes.len()).rev() {
-        if bytes[i - 1] == b'-' && bytes[i].is_ascii_digit() {
-            split_at = Some(i - 1);
-            break;
-        }
-    }
-    match split_at {
-        Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
-        None    => (s.to_string(), String::new()),
-    }
-}
-
 // ─── nixpkgs config ───────────────────────────────────────────────────────────
 
 /// Ensure ~/.config/nixpkgs/config.nix exists with allowUnfree = true.
@@ -422,6 +412,64 @@ pub fn switch_generation(gen: u32, task: &progress::TaskProgress) -> Result<()> 
     )?;
     if !ok { return Err(anyhow!("failed to switch to generation {}", gen)); }
     Ok(())
+}
+
+/// The generation number nix-env currently has active, if any.
+pub fn current_generation() -> Option<u32> {
+    list_generations()
+        .ok()?
+        .into_iter()
+        .find(|(_, _, current)| *current)
+        .map(|(num, _, _)| num)
+}
+
+/// Delete all but the `keep` most recent generations (the current one is
+/// always kept regardless of age). Used by `hnm update` / `hnm install` /
+/// `hnm remove` when `max_generations` in config.hk is set — see
+/// docs/hnm.html#config and #changelog (v0.2). `keep == 0` disables pruning.
+///
+/// Returns the number of generations actually deleted.
+pub fn prune_old_generations(keep: u32, task: &progress::TaskProgress) -> Result<usize> {
+    if keep == 0 {
+        return Ok(0);
+    }
+
+    let mut gens = list_generations()?;
+    if gens.len() <= keep as usize {
+        return Ok(0);
+    }
+
+    // Keep the most recent `keep` generations (highest numbers) plus
+    // whichever one is marked current, delete the rest.
+    gens.sort_by_key(|(num, _, _)| *num);
+    let to_delete: Vec<u32> = gens[..gens.len() - keep as usize]
+        .iter()
+        .filter(|(_, _, current)| !current)
+        .map(|(num, _, _)| *num)
+        .collect();
+
+    if to_delete.is_empty() {
+        return Ok(0);
+    }
+
+    let profile = config::profile_dir();
+    let list_arg = to_delete.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(" ");
+    task.log(&format!(
+        "nix-env --profile {} --delete-generations {}",
+        profile.display(), list_arg
+    ));
+
+    let profile_str = profile.to_str().unwrap().to_string();
+    let ok = progress::run_cmd_log(
+        &task,
+        safe_nix_env_cmd(&["--profile", &profile_str, "--delete-generations", &list_arg]),
+    )?;
+
+    if !ok {
+        return Err(anyhow!("nix-env --delete-generations failed"));
+    }
+
+    Ok(to_delete.len())
 }
 
 // ─── store du ────────────────────────────────────────────────────────────────
