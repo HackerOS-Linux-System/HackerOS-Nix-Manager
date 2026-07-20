@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use crate::{config, nix, output, progress, state};
+use crate::{config, nix, output, progress, shellrc, state};
 
-pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
+pub fn run(packages: &[String], no_env: bool) -> Result<()> {
     if packages.is_empty() {
         return Err(anyhow!("usage: hnm install <package> [<package>...]"));
     }
@@ -40,9 +40,17 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
 
         match result {
             Ok(_) => {
-                let version = nix::info(&bare)
-                    .map(|p| p.version)
-                    .unwrap_or_else(|_| "?".into());
+                // Reuse the same `nix-env -qa` lookup for version *and*
+                // description, instead of leaving description permanently
+                // `None` the way installs used to — see docs/hnm.html
+                // #changelog (v0.2). `hnm search` already benefits from
+                // the same underlying data via pkgdb's description column.
+                let info = nix::info(&bare).ok();
+                let version = info.as_ref().map(|p| p.version.clone()).unwrap_or_else(|| "?".into());
+                let description = info
+                    .as_ref()
+                    .map(|p| p.description.clone())
+                    .filter(|d| !d.is_empty());
 
                 let pkg = state::InstalledPkg {
                     name:         pkg_name.clone(),
@@ -50,7 +58,7 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
                     attr_path:    format!("nixpkgs.{}", bare),
                     installed_at: Utc::now(),
                     pinned:       None,
-                    description:  None,
+                    description,
                 };
                 state::add(pkg)?;
                 task.inc(10);
@@ -66,40 +74,63 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
     println!();
     if failed.is_empty() {
         output::ok("all packages installed successfully");
-        println!();
-        // Show PATH instructions clearly
-        let profile_bin = config::profile_dir().join("bin");
-        let default_bin = config::home().join(".nix-profile").join("bin");
 
-        output::info("To use installed packages, add to your ~/.zshrc or ~/.bashrc:");
-        println!();
-        println!("  export PATH=\"{}:$PATH\"", profile_bin.display());
-
-        // Find nix.sh
-        let nix_sh = find_nix_sh();
-        if let Some(sh) = nix_sh {
-            println!("  . '{}'", sh.display());
-        } else {
-            println!("  [ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \\");
-            println!("      . ~/.nix-profile/etc/profile.d/nix.sh");
+        if let Some(gen) = nix::current_generation() {
+            let _ = state::set_generation(gen);
         }
 
-        println!();
-        output::dim("Then reload: source ~/.zshrc  (or open a new terminal)");
+        // config.hk's `max_generations` — see docs/hnm.html#config.
+        if let Ok(cfg) = config::load() {
+            if cfg.max_generations > 0 {
+                let task = progress::TaskProgress::new(1, "pruning old generations");
+                if let Ok(n) = nix::prune_old_generations(cfg.max_generations, &task) {
+                    if n > 0 {
+                        output::dim(&format!("pruned {} old generation(s) (max_generations = {})", n, cfg.max_generations));
+                    }
+                }
+            }
+        }
 
-        // Quick check — if default nix profile has the binary, mention it
-        for pkg_name in packages {
-            let bare = pkg_name
-                .strip_prefix("nixpkgs.")
-                .or_else(|| pkg_name.strip_prefix("nixpkgs#"))
-                .unwrap_or(pkg_name);
-            let in_hnm_profile   = profile_bin.join(bare).exists();
-            let in_default_profile = default_bin.join(bare).exists();
-            if in_hnm_profile {
-                output::dim(&format!("  found: {}", profile_bin.join(bare).display()));
-            } else if in_default_profile {
-                output::dim(&format!("  found in default profile: {}", default_bin.join(bare).display()));
-                output::dim(&format!("  also add: export PATH=\"{}:$PATH\"", default_bin.display()));
+        // `--no-env` — skip the PATH activation hint. Meant for scripted /
+        // non-interactive installs where the caller already manages PATH
+        // itself (e.g. inside another packaging step). Previously this
+        // flag was parsed but silently ignored — see docs/hnm.html
+        // #changelog (v0.2).
+        if !no_env {
+            println!();
+            let profile_bin = config::profile_dir().join("bin");
+            let default_bin = config::home().join(".nix-profile").join("bin");
+
+            output::info("To use installed packages, add to your ~/.zshrc or ~/.bashrc:");
+            println!();
+            println!("  export PATH=\"{}:$PATH\"", profile_bin.display());
+
+            match shellrc::find_nix_sh() {
+                Some(sh) => println!("  . '{}'", sh.display()),
+                None => {
+                    println!("  [ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \\");
+                    println!("      . ~/.nix-profile/etc/profile.d/nix.sh");
+                }
+            }
+
+            println!();
+            output::dim("Then reload: source ~/.zshrc  (or open a new terminal)");
+            output::dim("Tip: `hnm env activate --yes` patches these files for you automatically.");
+
+            // Quick check — if default nix profile has the binary, mention it
+            for pkg_name in packages {
+                let bare = pkg_name
+                    .strip_prefix("nixpkgs.")
+                    .or_else(|| pkg_name.strip_prefix("nixpkgs#"))
+                    .unwrap_or(pkg_name);
+                let in_hnm_profile   = profile_bin.join(bare).exists();
+                let in_default_profile = default_bin.join(bare).exists();
+                if in_hnm_profile {
+                    output::dim(&format!("  found: {}", profile_bin.join(bare).display()));
+                } else if in_default_profile {
+                    output::dim(&format!("  found in default profile: {}", default_bin.join(bare).display()));
+                    output::dim(&format!("  also add: export PATH=\"{}:$PATH\"", default_bin.display()));
+                }
             }
         }
     } else {
@@ -108,14 +139,4 @@ pub fn run(packages: &[String], _no_env: bool) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn find_nix_sh() -> Option<std::path::PathBuf> {
-    let home = config::home();
-    let candidates = [
-        home.join(".nix-profile/etc/profile.d/nix.sh"),
-        std::path::PathBuf::from("/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"),
-        std::path::PathBuf::from("/etc/profile.d/nix.sh"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
 }
