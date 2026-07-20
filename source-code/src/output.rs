@@ -74,6 +74,23 @@ pub fn step(tag: &str, msg: &str) {
     println!("  {} {}", format!("[{}]", tag).cyan().bold(), msg.bright_cyan());
 }
 
+/// Ask a yes/no question on stdin, defaulting to "no" on empty input,
+/// EOF, or a non-interactive terminal. Used by `hnm remove` (without
+/// `--force`) and `hnm env activate/deactivate` (without `--yes`) — see
+/// docs/hnm.html#changelog (v0.2).
+pub fn confirm(prompt: &str) -> bool {
+    use std::io::{self, Write};
+
+    print!("  {} {} {} ", "?".yellow().bold(), prompt, "[y/N]".dimmed());
+    let _ = io::stdout().flush();
+
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 pub fn version() {
     println!();
     println!("  {} {}{}", "hnm".bright_cyan().bold(), "v".cyan(), env!("CARGO_PKG_VERSION").bright_cyan().bold());
