@@ -15,7 +15,7 @@ pub enum Command {
     Check,
     Info     { package: String },
     List     { installed: bool, json: bool },
-    Env      { sub: String },
+    Env      { sub: String, yes: bool },
     Doctor,
     Clean,
     Rollback { generation: Option<u32> },
@@ -133,9 +133,16 @@ pub fn parse() -> Result<Opts> {
         "env" => {
             let sub = match parser.next()? {
                 Some(Value(v)) => v.string()?,
-                _ => return Err(anyhow!("usage: hnm env <activate|deactivate|status>")),
+                _ => return Err(anyhow!("usage: hnm env <activate|deactivate|status> [--yes]")),
             };
-            Command::Env { sub }
+            let mut yes = false;
+            while let Some(arg) = parser.next()? {
+                match arg {
+                    Long("yes") | Short('y') => yes = true,
+                    _ => return Err(anyhow!(arg.unexpected())),
+                }
+            }
+            Command::Env { sub, yes }
         }
 
         "doctor" => Command::Doctor,
@@ -210,9 +217,9 @@ pub fn print_help() {
         ("install <pkg...>",     "Install one or more packages"),
         ("remove  <pkg...>",     "Remove one or more packages"),
         ("update  [pkg...]",     "Refresh channel and upgrade packages"),
-        ("upgrade",              "Upgrade HNM itself  [placeholder]"),
+        ("upgrade",              "Upgrade HNM itself (self-update from GitHub releases)"),
         ("info    <pkg>",        "Show package details"),
-        ("list    [-i]",         "List all / installed packages"),
+        ("list    [-i]",         "List available packages, or -i for installed only"),
         ("which   <pkg>",        "Show binary path of a package"),
         ("pin     <pkg> [ver]",  "Pin package to a version"),
         ("unpin   <pkg>",        "Unpin a package"),
@@ -229,7 +236,7 @@ pub fn print_help() {
         ("unpack",   "Bootstrap Nix (install + configure channel)"),
         ("check",    "Verify Nix installation (nix + nix-env versions)"),
         ("doctor",   "Full system diagnostics"),
-        ("env <sub>","Manage shell profile  [activate|deactivate|status]"),
+        ("env <sub>","Manage shell profile  [activate|deactivate|status] [-y]"),
         ("clean",    "Remove cached downloads and temp files"),
         ("version",  "Show HNM version info"),
         ("help",     "Show this help"),
@@ -241,8 +248,10 @@ pub fn print_help() {
     println!();
     println!("{}", "FLAGS".bright_cyan().bold().underline());
     println!("  {}  {}", format!("{:<26}", "--json").bright_cyan(), "Output as JSON (search, list)".dimmed());
-    println!("  {}  {}", format!("{:<26}", "--no-env").bright_cyan(), "Skip profile activation after install".dimmed());
-    println!("  {}  {}", format!("{:<26}", "-f / --force").bright_cyan(), "Force removal".dimmed());
+    println!("  {}  {}", format!("{:<26}", "-i / --installed").bright_cyan(), "list: show only HNM-tracked installed packages".dimmed());
+    println!("  {}  {}", format!("{:<26}", "--no-env").bright_cyan(), "install: skip the PATH activation hint at the end".dimmed());
+    println!("  {}  {}", format!("{:<26}", "-f / --force").bright_cyan(), "remove: skip the y/N confirmation prompt".dimmed());
+    println!("  {}  {}", format!("{:<26}", "-y / --yes").bright_cyan(), "env: patch/unpatch shell rc files instead of just printing".dimmed());
     println!();
     println!("  {} {}","Docs:".cyan(), "https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hnm.html".cyan().dimmed());
     println!();
