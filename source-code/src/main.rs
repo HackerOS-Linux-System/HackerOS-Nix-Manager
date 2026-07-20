@@ -5,7 +5,9 @@ mod nix;
 mod output;
 mod pkgdb;
 mod progress;
+mod shellrc;
 mod state;
+mod util;
 
 use cli::Command;
 
@@ -28,7 +30,7 @@ fn main() {
         Command::Check                            => commands::check::run(),
         Command::Info    { package }              => commands::info::run(&package),
         Command::List    { installed, json }      => commands::list::run(installed, json),
-        Command::Env     { sub }                  => commands::env::run(&sub),
+        Command::Env     { sub, yes }             => commands::env::run(&sub, yes),
         Command::Doctor                           => commands::doctor::run(),
         Command::Clean                            => commands::clean::run(),
         Command::Rollback { generation }          => commands::rollback::run(generation),
