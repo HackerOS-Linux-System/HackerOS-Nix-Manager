@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use crate::{nix, output, progress};
+use crate::{nix, output, progress, state};
 
 pub fn run(generation: Option<u32>) -> Result<()> {
     nix::ensure_nix()?;
@@ -40,8 +40,24 @@ pub fn run(generation: Option<u32>) -> Result<()> {
     nix::switch_generation(target, &task)?;
     task.finish_ok(&format!("rolled back to generation {}", target));
 
+    // Switching generations changes which packages are actually installed
+    // without touching state.json at all — `hnm list` used to go stale
+    // after a rollback because of this. Resync now. See docs/hnm.html
+    // #changelog (v0.2).
+    let _ = state::set_generation(target);
+    if let Ok(profile_pkgs) = nix::list_profile() {
+        if let Ok((added, removed)) = state::sync_from_profile(&profile_pkgs) {
+            if added > 0 || removed > 0 {
+                output::dim(&format!(
+                    "resynced tracked packages ({} added, {} removed)",
+                    added, removed
+                ));
+            }
+        }
+    }
+
     println!();
     output::ok(&format!("now at generation {}", target));
-    output::dim("Run `hnm list` to see current packages.");
+    output::dim("Run `hnm list -i` to see current packages.");
     Ok(())
 }
