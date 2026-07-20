@@ -1,16 +1,23 @@
 use anyhow::{anyhow, Result};
-use crate::{config, output};
+use crate::{config, output, shellrc};
 
-pub fn run(sub: &str) -> Result<()> {
+pub fn run(sub: &str, yes: bool) -> Result<()> {
     match sub {
-        "activate"   => activate(),
-        "deactivate" => deactivate(),
+        "activate"   => activate(yes),
+        "deactivate" => deactivate(yes),
         "status"     => status(),
         other => Err(anyhow!("unknown env subcommand '{}' — use activate | deactivate | status", other)),
     }
 }
 
-fn activate() -> Result<()> {
+// `hnm env activate/deactivate` used to only ever print instructions,
+// unlike `hnm unpack` which patches shell rc files automatically. Both
+// now share the same logic (src/shellrc.rs); `env` requires an explicit
+// `--yes`/`-y` opt-in since — unlike the one-shot bootstrap `unpack`
+// runs — this command can reasonably be called more than once. See
+// docs/hnm.html#changelog (v0.2).
+
+fn activate(yes: bool) -> Result<()> {
     output::header("Activate HNM profile");
 
     let profile = config::profile_dir();
@@ -22,13 +29,27 @@ fn activate() -> Result<()> {
         .unwrap_or_else(|_| profile.clone());
     let resolved_bin = resolved.join("bin");
 
+    if yes {
+        output::info("patching shell rc files (~/.bashrc, ~/.zshrc, ~/.profile)...");
+        println!();
+        let patched = shellrc::patch(&bin_dir);
+        println!();
+        if patched.is_empty() {
+            output::info("nothing to patch — already activated, or no rc files found");
+        } else {
+            output::ok(&format!("patched: {}", patched.join(", ")));
+            output::dim("Reload your shell (or open a new terminal) to apply.");
+        }
+        return Ok(());
+    }
+
     output::info("Add the following to your ~/.bashrc or ~/.zshrc:");
     println!();
     println!("  # HNM + Nix");
     println!("  export PATH=\"{}:$PATH\"", bin_dir.display());
 
     // Also find and print the nix.sh sourcing line
-    let nix_sh = find_nix_sh();
+    let nix_sh = shellrc::find_nix_sh();
     if let Some(ref sh) = nix_sh {
         println!("  [ -f '{}' ] && . '{}'", sh.display(), sh.display());
     } else {
@@ -44,6 +65,8 @@ fn activate() -> Result<()> {
         println!("  . '{}'", sh.display());
     }
 
+    println!();
+    output::dim("Tip: run `hnm env activate --yes` to patch these files automatically.");
     println!();
 
     // Show what's actually in the profile bin
@@ -63,21 +86,35 @@ fn activate() -> Result<()> {
         output::warn("profile/bin does not exist yet — install a package first");
     }
 
-    // Check if nix-env actually installed to our custom profile or default
-    output::dim("");
-    output::dim("NOTE: if 'steam' was installed before env activate, also check:");
-    output::dim("  ~/.nix-profile/bin/steam");
-
     println!();
     Ok(())
 }
 
-fn deactivate() -> Result<()> {
+fn deactivate(yes: bool) -> Result<()> {
     output::header("Deactivate HNM profile");
     let profile = config::profile_dir();
-    output::info("Remove this line from your ~/.bashrc or ~/.zshrc:");
+
+    if yes {
+        output::info("removing the HNM block from shell rc files...");
+        println!();
+        let unpatched = shellrc::unpatch();
+        println!();
+        if unpatched.is_empty() {
+            output::info("nothing to remove — no rc file had an HNM block");
+        } else {
+            output::ok(&format!("unpatched: {}", unpatched.join(", ")));
+            output::dim("Restart your shell (or open a new terminal) to apply.");
+        }
+        return Ok(());
+    }
+
+    output::info("Remove this block from your ~/.bashrc or ~/.zshrc:");
     println!();
+    println!("  {}", shellrc::MARKER);
     println!("  export PATH=\"{}:$PATH\"", profile.join("bin").display());
+    println!("  [ -f ... ] && . ...   # nix.sh sourcing line");
+    println!();
+    output::dim("Tip: run `hnm env deactivate --yes` to do this automatically.");
     println!();
     output::ok("done — restart your shell to apply");
     Ok(())
@@ -106,6 +143,24 @@ fn status() -> Result<()> {
         .unwrap_or(false);
     output::label("nix profile", if nix_profile_sourced { "sourced ✓" } else { "not sourced" });
 
+    // Whether a shell rc file already has the HNM block patched in.
+    let home = config::home();
+    let patched_files: Vec<String> = [".bashrc", ".zshrc", ".profile"]
+        .into_iter()
+        .filter(|rc| {
+            std::fs::read_to_string(home.join(rc))
+                .map(|c| c.contains(shellrc::MARKER))
+                .unwrap_or(false)
+        })
+        .map(String::from)
+        .collect();
+    let patched_label = if patched_files.is_empty() {
+        "none (run `hnm env activate --yes`)".to_string()
+    } else {
+        patched_files.join(", ")
+    };
+    output::label("rc files patched", &patched_label);
+
     // Show what's installed in the profile
     if bin_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&bin_dir) {
@@ -128,14 +183,4 @@ fn status() -> Result<()> {
 
     println!();
     Ok(())
-}
-
-fn find_nix_sh() -> Option<std::path::PathBuf> {
-    let home = config::home();
-    let candidates = [
-        home.join(".nix-profile/etc/profile.d/nix.sh"),
-        std::path::PathBuf::from("/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"),
-        std::path::PathBuf::from("/etc/profile.d/nix.sh"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
 }
