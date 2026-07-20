@@ -1,24 +1,7 @@
 use anyhow::{anyhow, Result};
-use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use crate::{config, nix, output, progress};
-
-fn find_nix_sh() -> Option<PathBuf> {
-    // When running as root, Nix installs to /root/.nix-profile
-    // For multi-user install, the daemon script is elsewhere
-    let home = config::home();
-    [
-        home.join(".nix-profile/etc/profile.d/nix.sh"),
-        PathBuf::from("/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"),
-        PathBuf::from("/etc/profile.d/nix.sh"),
-        home.join(".local/state/nix/profiles/profile/etc/profile.d/nix.sh"),
-        PathBuf::from("/root/.nix-profile/etc/profile.d/nix.sh"),
-    ]
-    .into_iter()
-    .find(|p| p.exists())
-}
+use crate::{config, nix, output, progress, shellrc};
 
 fn has_bin(name: &str) -> bool {
     Command::new("which")
@@ -33,45 +16,6 @@ fn has_bin(name: &str) -> bool {
 fn is_root() -> bool {
     // Check effective UID
     unsafe { libc::geteuid() == 0 }
-}
-
-/// Patch shell rc files with HNM PATH lines
-fn patch_shell_rc(profile_bin: &std::path::Path) {
-    let home = config::home();
-    let nix_sh = find_nix_sh();
-
-    let nix_sh_line = match nix_sh {
-        Some(ref p) => format!("[ -f '{}' ] && . '{}'", p.display(), p.display()),
-        None => "[ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \
-                 . ~/.nix-profile/etc/profile.d/nix.sh"
-            .to_string(),
-    };
-
-    let block = format!(
-        "\n# HNM — HackerOS Nix Manager\nexport PATH=\"{}:$HOME/.nix-profile/bin:$PATH\"\n{}\n",
-        profile_bin.display(),
-        nix_sh_line,
-    );
-    let marker = "# HNM — HackerOS Nix Manager";
-
-    for rc in &[".bashrc", ".zshrc", ".profile"] {
-        let rc_path = home.join(rc);
-        if !rc_path.exists() {
-            continue;
-        }
-        let content = fs::read_to_string(&rc_path).unwrap_or_default();
-        if content.contains(marker) {
-            output::dim(&format!("  ~/{} — already patched", rc));
-            continue;
-        }
-        match fs::OpenOptions::new().append(true).open(&rc_path) {
-            Ok(mut f) => {
-                let _ = f.write_all(block.as_bytes());
-                output::ok(&format!("patched ~/{}", rc));
-            }
-            Err(e) => output::warn(&format!("could not patch ~/{}: {}", rc, e)),
-        }
-    }
 }
 
 /// Build the augmented PATH vec that includes nix-profile/bin
@@ -182,7 +126,7 @@ pub fn run() -> Result<()> {
     }
 
     // ── Step 2 — report nix.sh location ──────────────────────────────────────
-    match find_nix_sh() {
+    match shellrc::find_nix_sh() {
         Some(ref p) => output::ok(&format!("nix profile script: {}", p.display())),
         None        => output::warn(
             "nix.sh not found — you may need to open a new shell first",
@@ -231,7 +175,7 @@ pub fn run() -> Result<()> {
     // ── Step 4 — patch shell rc files ────────────────────────────────────────
     println!();
     output::info("Patching shell RC files...");
-    patch_shell_rc(&config::profile_dir().join("bin"));
+    shellrc::patch(&config::profile_dir().join("bin"));
 
     // ── Done ─────────────────────────────────────────────────────────────────
     println!();
