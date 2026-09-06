@@ -1,0 +1,3606 @@
+use "std -> strings" from "str"
+use "std -> env" from "env"
+use "std -> fs" from "fs"
+use "std -> path" from "path"
+use "std -> json" from "json"
+use "std -> conv" from "conv"
+use "std -> fmt" from "fmt"
+use "std -> cli" from "cli"
+use "std -> os" from "os"
+use "std -> time" from "time"
+use "std -> sort" from "sort"
+
+pub const HNM_VERSION: string = "0.2"
+pub const HNM_SHELLRC_MARKER: string = "# HNM \xe2\x80\x94 HackerOS Nix Manager"
+pub const HNM_LIST_DEFAULT_ALL_LIMIT: int = 200
+pub const HNM_UPSTREAM_VERSION_URL: string =
+pub const HNM_UPSTREAM_RELEASE_URL: string =
+
+;; ── from util.h# ──────────────────────────────────────
+;; util.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/util.rs
+;;
+;; Small string helpers with no other HNM module dependencies.
+
+
+mod util is
+
+    ;; Split a "name-version" string (as produced by `nix-env -qaP`, e.g.
+    ;; "ripgrep-14.1.1") into ("ripgrep", "14.1.1"). Mirrors the original
+    ;; Rust `split_name_version`: walks backwards looking for the LAST
+    ;; "-<digit>" boundary, so a name containing embedded digits/dashes
+    ;; (e.g. "python3.11-requests-2.31.0") still splits correctly.
+    ;;
+    ;; Returns a 2-element array: [name, version]. (H# has no tuple
+    ;; return type in this grammar, so an array stands in for Rust's
+    ;; `(String, String)` — every call site destructures index 0 / 1.)
+    pub fn split_name_version(s: string) -> [string] is
+        let n: int = s.len()
+        let mut split_at: int = -1
+        let mut i: int = n - 1
+        while i >= 1 is
+            let prev: string = s[i - 1..i]
+            let cur:  string = s[i..i + 1]
+            if prev == "-" && str::is_numeric(cur) is
+                split_at = i - 1
+                break
+            end
+            i = i - 1
+        end
+
+        if split_at >= 0 is
+            return [s[0..split_at], s[split_at + 1..n]]
+        end
+        return [s, ""]
+    end
+
+    ;; ── [EXTENDED] shell command assembly ────────────────────────────
+    ;; H#'s process primitive (the compiler-injected `proc_run_cmd`, see
+    ;; PORTING-NOTES.md) runs one shell string through `/bin/sh -c`,
+    ;; unlike Rust's `std::process::Command` builder (program + argv
+    ;; array + env map, no shell involved). These two helpers rebuild
+    ;; that same "program, explicit args, explicit env vars, no shell
+    ;; injection risk from the ARGS" shape on top of a single shell
+    ;; string, by single-quoting every argument/value exactly the way
+    ;; nix.rs's own `safe_nix_env_cmd` already single-quoted its args
+    ;; before this port existed.
+
+    ;; POSIX single-quote a value: close the quote, emit an escaped
+    ;; literal quote, reopen the quote.
+    pub fn shell_quote(s: string) -> string is
+        return "'" + str::replace_all(s, "'", "'\\''") + "'"
+    end
+
+    ;; Build a safe `VAR1='v1' VAR2='v2' program 'arg1' 'arg2'` line.
+    ;; `env_pairs` is a flat array: [key1, val1, key2, val2, ...].
+    pub fn build_shell_cmd(program: string, args: [string], env_pairs: [string]) -> string is
+        let mut out: string = ""
+        let mut i: int = 0
+        while i + 1 < env_pairs.len() is
+            out = out + env_pairs[i] + "=" + shell_quote(env_pairs[i + 1]) + " "
+            i = i + 2
+        end
+        out = out + shell_quote(program)
+        let mut j: int = 0
+        while j < args.len() is
+            out = out + " " + shell_quote(args[j])
+            j = j + 1
+        end
+        return out
+    end
+
+end
+
+;; ── from config.h# ──────────────────────────────────────
+;; config.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/config.rs
+;;
+;; ADAPTATION NOTE: the original stores config in a custom `.hk` format
+;; via the external `hk_parser` crate (IndexMap<String, HkValue>). H#'s
+;; `std -> json` module only supports FLAT scalar objects — which is
+;; exactly the shape `HnmConfig` is (4 scalar fields, no nesting) — so
+;; the port reuses that flat-JSON module to serialize the same data,
+;; still saved under the `config.hk` filename for continuity with the
+;; original layout/docs. See PORTING-NOTES.md.
+
+
+mod config is
+
+    struct HnmConfig is
+        pub nix_channel:     string
+        pub profile_dir:     string
+        pub auto_gc:         bool
+        pub max_generations: int
+    end
+
+    pub fn default_config() -> HnmConfig is
+        return HnmConfig {
+            nix_channel:     "https://nixos.org/channels/nixpkgs-unstable",
+            profile_dir:     profile_dir(),
+            auto_gc:         false,
+            max_generations: 10,
+        }
+    end
+
+    ;; H#'s `env::home()` reads $HOME directly (see std/env.h#) — the
+    ;; equivalent of Rust's `dirs::home_dir()` with the same "/root"
+    ;; fallback the original used.
+    pub fn home() -> string is
+        let h: string = env::home()
+        if h == "" is return "/root" end
+        return h
+    end
+
+    pub fn config_dir() -> string is
+        return path::join(path::join(home(), ".config"), "hnm")
+    end
+
+    pub fn profile_dir() -> string is
+        return path::join(path::join(home(), ".hnm"), "profile")
+    end
+
+    pub fn data_dir() -> string is
+        return path::join(path::join(home(), ".local/share"), "hnm")
+    end
+
+    ;; Path to the config file — historically config.toml, now config.hk
+    ;; (see docs/hnm.html#config). If an old config.toml is found and
+    ;; config.hk is not, it is migrated automatically.
+    pub fn config_path() -> string is
+        return path::join(config_dir(), "config.hk")
+    end
+
+    fn legacy_config_path() -> string is
+        return path::join(config_dir(), "config.toml")
+    end
+
+    ;; ─── very small legacy TOML reader ──────────────────────────────
+    ;; Just enough to migrate the handful of flat `key = value` lines
+    ;; HNM's old config.toml ever wrote — not a general TOML parser.
+    fn migrate_legacy_toml(raw: string) -> HnmConfig is
+        let mut cfg: HnmConfig = default_config()
+        let lines: [string] = str::split(raw, "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let line: string = str::trim(lines[i])
+            let eq: int = str::index_of(line, "=")
+            if eq >= 0 is
+                let key: string = str::trim(line[0..eq])
+                let mut val: string = str::trim(line[eq + 1..line.len()])
+                val = str::remove_prefix(val, "\"")
+                val = str::remove_suffix(val, "\"")
+
+                if key == "nix_channel" is cfg.nix_channel = val end
+                if key == "profile_dir" is cfg.profile_dir = val end
+                if key == "auto_gc" is cfg.auto_gc = (str::to_lower(val) == "true") end
+                if key == "max_generations" is
+                    if str::is_numeric(val) is
+                        cfg.max_generations = conv::str_to_int(val)
+                    end
+                end
+            end
+            i = i + 1
+        end
+        return cfg
+    end
+
+    ;; ─── HnmConfig <-> flat JSON conversion ─────────────────────────
+    fn to_json(cfg: HnmConfig) -> string is
+        let mut obj: string = json::object()
+        obj = json::set_str(obj, "nix_channel", cfg.nix_channel)
+        obj = json::set_str(obj, "profile_dir", cfg.profile_dir)
+        obj = json::set_bool(obj, "auto_gc", cfg.auto_gc)
+        obj = json::set_int(obj, "max_generations", cfg.max_generations)
+        return obj
+    end
+
+    fn from_json(raw: string) -> HnmConfig is
+        let default: HnmConfig = default_config()
+        if !json::has_key(raw, "nix_channel") is
+            ;; malformed/legacy file — fall back to defaults rather than
+            ;; hard-erroring, mirroring the original's tolerant behavior
+            return default
+        end
+        let mut cfg: HnmConfig = default
+        cfg.nix_channel = json::get_str(raw, "nix_channel")
+        cfg.profile_dir = json::get_str(raw, "profile_dir")
+        cfg.auto_gc     = json::get_bool(raw, "auto_gc")
+        let mg: int = json::get_int(raw, "max_generations")
+        if mg > 0 is cfg.max_generations = mg end
+        return cfg
+    end
+
+    ;; ─── public API ──────────────────────────────────────────────────
+
+    pub fn load() -> HnmConfig is
+        let p: string = config_path()
+
+        if !fs::exists(p) is
+            let mut cfg: HnmConfig = default_config()
+            if fs::exists(legacy_config_path()) is
+                let raw: string = fs::read(legacy_config_path())
+                cfg = migrate_legacy_toml(raw)
+                write("  · migrated ~/.config/hnm/config.toml -> config.hk")
+            end
+            save(cfg)
+            return cfg
+        end
+
+        let raw: string = fs::read(p)
+        return from_json(raw)
+    end
+
+    pub fn save(cfg: HnmConfig) is
+        fs::mkdir(config_dir())
+        fs::write(config_path(), to_json(cfg))
+    end
+
+end
+
+;; ── from output.h# ──────────────────────────────────────
+;; output.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/output.rs
+;;
+;; COLOR SCHEME  (kept identical to the original)
+;;   errors      -> red    bold + underline
+;;   warnings    -> yellow underline
+;;   primary     -> bright cyan
+;;   secondary   -> cyan
+;;
+;; ADAPTATION NOTE: the original uses the `owo_colors` crate for ANSI
+;; styling. H# has no terminal-color crate, so this port emits the raw
+;; ANSI escape codes directly (the same codes owo_colors itself would
+;; emit), using `std -> fmt`'s helpers where the exact SGR code matches
+;; and raw `\x1b[...m` sequences where it needs bold+underline combos
+;; fmt.h# doesn't expose as one helper.
+
+
+;; Compile-time-ish version string. Cargo baked CARGO_PKG_VERSION into
+;; the original binary at build time; H# has no build-time env
+;; substitution, so this is a plain top-level constant instead — kept
+;; in sync with version.hacker by convention (see PORTING-NOTES.md).
+
+mod output is
+
+    ;; ── raw ANSI helpers not covered by std -> fmt ──────────────────
+    fn bright_cyan(s: string) -> string is return "\x1b[96m" + s + "\x1b[0m" end
+    fn cyan(s: string)        -> string is return "\x1b[36m" + s + "\x1b[0m" end
+    fn red_bold_ul(s: string) -> string is return "\x1b[1;4;31m" + s + "\x1b[0m" end
+    fn yellow_ul(s: string)   -> string is return "\x1b[4;33m" + s + "\x1b[0m" end
+    fn bright_cyan_bold(s: string) -> string is return "\x1b[1;96m" + s + "\x1b[0m" end
+    fn cyan_bold_ul(s: string) -> string is return "\x1b[1;4;36m" + s + "\x1b[0m" end
+    fn cyan_dim(s: string)     -> string is return "\x1b[2;36m" + s + "\x1b[0m" end
+
+    pub fn error(msg: string) is
+        write(red_bold_ul(" ERROR ") + " " + red_bold_ul(msg))
+    end
+
+    pub fn warn(msg: string) is
+        write(yellow_ul(" WARN ") + " " + yellow_ul(msg))
+    end
+
+    pub fn ok(msg: string) is
+        write(bright_cyan_bold("\xe2\x9c\x93") + " " + bright_cyan(msg))
+    end
+
+    pub fn info(msg: string) is
+        write(cyan("\xc2\xb7") + " " + msg)
+    end
+
+    pub fn dim(msg: string) is
+        write("  " + cyan_dim(msg))
+    end
+
+    pub fn header(title: string) is
+        let bar: string = fmt::repeat("\xe2\x94\x80", title.len() + 4)
+        write("")
+        write("  " + bright_cyan_bold("\xe2\x96\xb8") + " " + bright_cyan_bold(title))
+        write("  " + cyan_dim(bar))
+    end
+
+    pub fn label(key: string, val: string) is
+        write("  " + fmt::pad_left(cyan(key), 16 + 9) + "  " + bright_cyan(val))
+        ;; NOTE: `fmt::pad_left` pads on the raw (ANSI-included) string,
+        ;; so the +9 compensates for the injected escape-code length to
+        ;; keep the visible column width at 16, matching Rust's
+        ;; `{:>16}` on the *plain* text.
+    end
+
+    pub fn table_header() is
+        write("  " + fmt::pad_right(cyan_bold_ul("PACKAGE"), 32 + 18) + "  " +
+                     fmt::pad_right(cyan_bold_ul("VERSION"), 14 + 18) + "  " +
+                     cyan_bold_ul("DESCRIPTION"))
+        write("  " + cyan_dim(fmt::repeat("\xe2\x94\x80", 80)))
+    end
+
+    pub fn table_row(name: string, version: string, desc: string, is_installed: bool) is
+        let mut marker: string = ""
+        if is_installed is marker = " \xe2\x9c\x93" end
+        let full_name: string = name + marker
+        let short_desc: string = fmt::truncate(desc, 52)
+        write("  " + fmt::pad_right(bright_cyan_bold(full_name), full_name.len() + 34) + "  " +
+                     fmt::pad_right(cyan(version), version.len() + 16) + "  " +
+                     cyan_dim(short_desc))
+    end
+
+    pub fn log_line(msg: string) is
+        write("  " + cyan_dim("\xe2\x94\x82") + " " + cyan_dim(msg))
+    end
+
+    pub fn step(tag: string, msg: string) is
+        write("  " + bright_cyan_bold("[" + tag + "]") + " " + bright_cyan(msg))
+    end
+
+    ;; Ask a yes/no question on stdin, defaulting to "no" on empty
+    ;; input / EOF. Used by `hnm remove` (without --force) and
+    ;; `hnm env activate/deactivate` (without --yes).
+    pub fn confirm(prompt: string) -> bool is
+        return cli::confirm("  ? " + prompt)
+    end
+
+    pub fn version_info() is
+        write("")
+        write("  " + bright_cyan_bold("hnm") + " " + cyan("v") + bright_cyan_bold(hnm_version()))
+        write("  " + cyan("HackerOS Nix Manager"))
+        write("  " + cyan_dim("Part of the HackerOS ecosystem"))
+        write("")
+
+        let nix_r  = proc_run_cmd("nix --version", 5)
+        let mut nix_ver: string = "not installed"
+        if nix_r.exit_code == 0 is nix_ver = str::trim(nix_r.stdout) end
+
+        let env_r  = proc_run_cmd("nix-env --version", 5)
+        let mut nix_env_ver: string = "not installed"
+        if env_r.exit_code == 0 is nix_env_ver = str::trim(env_r.stdout) end
+
+        label("nix", nix_ver)
+        label("nix-env", nix_env_ver)
+        label("platform", os::platform())
+        label("arch", os::arch())
+        write("")
+    end
+
+    fn hnm_version() -> string is
+        return HNM_VERSION
+    end
+
+end
+
+;; ── from progress.h# ──────────────────────────────────────
+;; progress.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/progress.rs
+;;
+;; ADAPTATION NOTE: the original renders a live, ticking `indicatif`
+;; spinner/progress bar. H# has no terminal-animation/threading
+;; library, and its process primitive (`proc_run_cmd`, see
+;; PORTING-NOTES.md) captures a command's output only after it exits —
+;; it can't stream lines as they're produced. So this port keeps the
+;; same *log-line* output shape and the same OK/WARN/ERR line styling,
+;; but prints them as the captured output is processed after the
+;; command finishes, rather than live during execution. Functionally
+;; equivalent end-to-end log; not a live-updating bar.
+
+
+mod progress is
+
+    struct TaskProgress is
+        pub label: string
+    end
+
+    pub fn new_task(total: int, label: string) is
+        write("  " + label + " ...")
+    end
+
+    ;; Kept for signature parity with the original (`TaskProgress::new`);
+    ;; `total` is unused for the same reason `inc` below is a no-op.
+    pub fn task(total: int, label: string) -> TaskProgress is
+        new_task(total, label)
+        return TaskProgress { label: label }
+    end
+
+    pub fn log(t: TaskProgress, msg: string) is
+        write("  \xe2\x94\x82 " + msg)
+    end
+
+    pub fn warn(t: TaskProgress, msg: string) is
+        write("  \xe2\x94\x82 WARN " + msg)
+    end
+
+    pub fn err_line(t: TaskProgress, msg: string) is
+        write("  \xe2\x94\x82 ERR  " + msg)
+    end
+
+    ;; No-op: there is no live bar to update the label/percentage of —
+    ;; see the module doc comment. Kept so call sites don't need
+    ;; special-casing.
+    pub fn set_msg(t: TaskProgress, msg: string) is end
+    pub fn inc(t: TaskProgress, delta: int) is end
+
+    pub fn finish_ok(t: TaskProgress, msg: string) is
+        write("  \xe2\x9c\x93 " + msg)
+    end
+
+    pub fn finish_err(t: TaskProgress, msg: string) is
+        write("  \xe2\x9c\x97 " + msg)
+    end
+
+    ;; Run a pre-assembled shell command line (see util::build_shell_cmd),
+    ;; logging its combined stdout/stderr line-by-line through `t`, and
+    ;; return true iff it exited 0. `timeout_secs <= 0` means unlimited
+    ;; — same convention as the underlying `proc_run_cmd`.
+    pub fn run_cmd_log(t: TaskProgress, shell_cmd: string, timeout_secs: int) -> bool is
+        let result = proc_run_cmd(shell_cmd, timeout_secs)
+
+        if result.stdout.len() > 0 is
+            let lines: [string] = str::split(result.stdout, "\n")
+            let mut i: int = 0
+            while i < lines.len() is
+                if lines[i].len() > 0 is log(t, lines[i]) end
+                i = i + 1
+            end
+        end
+
+        if result.stderr.len() > 0 is
+            let lines: [string] = str::split(result.stderr, "\n")
+            let mut i: int = 0
+            while i < lines.len() is
+                let l: string = lines[i]
+                if l.len() > 0 is
+                    let lc: string = str::to_lower(l)
+                    if str::index_of(lc, "error:") >= 0 || str::index_of(lc, "error") == 0 is
+                        err_line(t, l)
+                    else is
+                        log(t, l)
+                    end
+                end
+                i = i + 1
+            end
+        end
+
+        return result.exit_code == 0
+    end
+
+    ;; Convenience: run a shell string with explicit env vars (compat
+    ;; shim mirroring the original's `run_shell_log_env`).
+    pub fn run_shell_log_env(t: TaskProgress, shell_cmd: string, env_pairs: [string]) -> bool is
+        let full: string = util::build_shell_cmd("sh", ["-c", shell_cmd], env_pairs)
+        return run_cmd_log(t, full, 0)
+    end
+
+    ;; Compatibility shim used by cmd_unpack and others (mirrors the
+    ;; original's `run_with_log_env` / `run_with_log`).
+    pub fn run_with_log_env(t: TaskProgress, program: string, args: [string], env_pairs: [string]) -> bool is
+        let full: string = util::build_shell_cmd(program, args, env_pairs)
+        return run_cmd_log(t, full, 0)
+    end
+
+    pub fn run_with_log(t: TaskProgress, program: string, args: [string]) -> bool is
+        return run_with_log_env(t, program, args, [])
+    end
+
+end
+
+;; ── from nixjson.h# ──────────────────────────────────────
+;; nixjson.h# — HackerOS Nix Manager (H# port)
+;; [EXTENDED / NEW MODULE — not present in the original Rust source]
+;;
+;; The original uses `serde_json::Value` to pull NESTED fields out of
+;; `nix-env --json` output, e.g. `info["meta"]["license"]["spdxId"]`.
+;; H#'s `std -> json` module (v0.7) is intentionally flat-object-only
+;; (see its own doc comment) — there is no real parsed-tree type on the
+;; LLVM backend to index into. This module is a small, purpose-built
+;; extractor for exactly the handful of (possibly nested-one-level)
+;; string fields HNM actually needs out of `nix-env`'s JSON, using
+;; plain string scanning (balanced-brace matching for sub-objects,
+;; quote-aware scanning for string values) rather than a general parser.
+
+
+mod nixjson is
+
+    ;; Extract the string value of "key":"value" from a flat-ish JSON
+    ;; text, tolerating an optional space after the colon. "" if absent
+    ;; or if the field isn't a plain string (e.g. it's `null`).
+    pub fn field(text: string, key: string) -> string is
+        let needle_tight: string = "\"" + key + "\":\""
+        let needle_space: string = "\"" + key + "\": \""
+
+        let mut start: int = str::index_of(text, needle_tight)
+        let mut skip: int = needle_tight.len()
+        if start < 0 is
+            start = str::index_of(text, needle_space)
+            skip = needle_space.len()
+        end
+        if start < 0 is return "" end
+
+        let from: int = start + skip
+        let n: int = text.len()
+        let mut i: int = from
+        let mut out: string = ""
+        while i < n is
+            let ch: string = text[i..i + 1]
+            if ch == "\\" && i + 1 < n is
+                let nxt: string = text[i + 1..i + 2]
+                if nxt == "\"" is
+                    out = out + "\""
+                    i = i + 2
+                else is
+                    if nxt == "\\" is
+                        out = out + "\\"
+                        i = i + 2
+                    else is
+                        out = out + ch
+                        i = i + 1
+                    end
+                end
+            else is
+                if ch == "\"" is
+                    return out
+                end
+                out = out + ch
+                i = i + 1
+            end
+        end
+        return out
+    end
+
+    ;; Extract the raw text of a nested object value: "key":{ ... },
+    ;; with balanced-brace matching. "" if absent.
+    pub fn object_field(text: string, key: string) -> string is
+        let needle: string = "\"" + key + "\":{"
+        let start: int = str::index_of(text, needle)
+        if start < 0 is return "" end
+
+        let n: int = text.len()
+        let mut i: int = start + needle.len() - 1 ;; index of the opening '{'
+        let mut depth: int = 0
+        let mut out: string = ""
+        while i < n is
+            let ch: string = text[i..i + 1]
+            out = out + ch
+            if ch == "{" is depth = depth + 1 end
+            if ch == "}" is
+                depth = depth - 1
+                if depth == 0 is return out end
+            end
+            i = i + 1
+        end
+        return out
+    end
+
+    ;; Whether `field(text, key)` would find anything (string OR nested
+    ;; object) for `key`.
+    pub fn has_field(text: string, key: string) -> bool is
+        if str::index_of(text, "\"" + key + "\":\"") >= 0 is return true end
+        if str::index_of(text, "\"" + key + "\": \"") >= 0 is return true end
+        if str::index_of(text, "\"" + key + "\":{") >= 0 is return true end
+        return false
+    end
+
+    ;; nix-env's `--query --available -A <attr> --json` output shape is
+    ;; `{"<attrPath>": { ...fields... }}` — a single-entry object keyed
+    ;; by the attribute path we asked for. Returns [attrPath, bodyText].
+    pub fn unwrap_single_entry(text: string) -> [string] is
+        let trimmed: string = str::trim(text)
+        if trimmed.len() < 2 is return ["", ""] end
+        let inner: string = trimmed[1..trimmed.len() - 1] ;; strip outer { }
+
+        ;; find the first top-level "key":{ ... and take everything up
+        ;; to its matching close brace as the body
+        let colon_brace: int = str::index_of(inner, "\":{")
+        if colon_brace < 0 is return ["", ""] end
+        let key: string = inner[1..colon_brace]
+
+        let mut i: int = colon_brace + 2 ;; at the '{'
+        let n: int = inner.len()
+        let mut depth: int = 0
+        let mut body: string = ""
+        while i < n is
+            let ch: string = inner[i..i + 1]
+            body = body + ch
+            if ch == "{" is depth = depth + 1 end
+            if ch == "}" is
+                depth = depth - 1
+                if depth == 0 is
+                    return [key, body]
+                end
+            end
+            i = i + 1
+        end
+        return [key, ""]
+    end
+
+end
+
+;; ── from pkgdb.h# ──────────────────────────────────────
+;; pkgdb.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/pkgdb.rs
+;;
+;; ADAPTATION NOTE: the original streams `nix-env -qaP --description`
+;; line-by-line into the TSV file with O(1) RAM via a spawned child +
+;; a stderr-draining thread. H# has no threading and `proc_run_cmd`
+;; only returns output after the whole command exits (see
+;; PORTING-NOTES.md) — so this port captures the full output in one
+;; shot and then writes it out to the TSV file. RAM usage is therefore
+;; O(output size) rather than O(1), a real behavioral difference,
+;; documented here rather than hidden.
+
+
+mod pkgdb is
+
+    struct Entry is
+        pub attr:        string
+        pub name:        string
+        pub version:     string
+        pub description: string
+    end
+
+    pub fn db_path() -> string is
+        return path::join(config::data_dir(), "pkgdb.tsv")
+    end
+
+    fn parse_row(line: string) -> Entry is
+        let parts: [string] = str::splitn(line, "\t", 4)
+        let mut attr: string = ""
+        let mut name: string = ""
+        let mut version: string = ""
+        let mut description: string = ""
+        if parts.len() > 0 is attr = parts[0] end
+        if parts.len() > 1 is name = parts[1] end
+        if parts.len() > 2 is version = parts[2] end
+        if parts.len() > 3 is description = parts[3] end
+        return Entry { attr: attr, name: name, version: version, description: description }
+    end
+
+    ;; Search the local cache. Fast, and — unlike the original's
+    ;; streamed-from-disk BufReader — reads the whole file into memory
+    ;; first via `fs::read_lines`; still effectively instantaneous for
+    ;; a package index (tens of thousands of lines, single-digit MB).
+    pub fn search(query: string) -> [Entry] is
+        let p: string = db_path()
+        if !fs::exists(p) is return [] end
+
+        let q: string = str::to_lower(query)
+        let lines: [string] = fs::read_lines(p)
+        let mut results: [Entry] = []
+        let mut i: int = 0
+        while i < lines.len() is
+            let line: string = lines[i]
+            if line.len() > 0 is
+                let e: Entry = parse_row(line)
+                if str::index_of(str::to_lower(e.attr), q) >= 0 ||
+                   str::index_of(str::to_lower(e.name), q) >= 0 ||
+                   str::index_of(str::to_lower(e.description), q) >= 0 is
+                    results.push(e)
+                end
+            end
+            i = i + 1
+        end
+        return results
+    end
+
+    ;; Every entry in the index, in file order. `limit < 0` means
+    ;; unlimited (mirrors the original's `limit: Option<usize>`).
+    pub fn all(limit: int) -> [Entry] is
+        let p: string = db_path()
+        if !fs::exists(p) is return [] end
+
+        let lines: [string] = fs::read_lines(p)
+        let mut results: [Entry] = []
+        let mut i: int = 0
+        while i < lines.len() is
+            if lines[i].len() > 0 is
+                results.push(parse_row(lines[i]))
+                if limit >= 0 && results.len() >= limit is break end
+            end
+            i = i + 1
+        end
+        return results
+    end
+
+    ;; Freshness check ( < 7 days old ). [ADAPTED] H#'s `fs` module has
+    ;; no file-metadata "age" helper beyond `modified_time` (unix
+    ;; timestamp) — compared directly against `time::now_unix()`.
+    pub fn is_fresh() -> bool is
+        let p: string = db_path()
+        if !fs::exists(p) is return false end
+        let modified: int = fs::modified_time(p)
+        let age: int = time::now_unix() - modified
+        return age < (7 * 24 * 3600)
+    end
+
+    pub fn entry_count() -> int is
+        let p: string = db_path()
+        if !fs::exists(p) is return 0 end
+        return fs::read_lines(p).len()
+    end
+
+    ;; Rebuild the package database. See the module doc comment above
+    ;; for the streaming-vs-batch RAM tradeoff of this port.
+    ;;
+    ;; `log`/`elog` are callback-style closures exactly like the
+    ;; original's `impl Fn(&str)` parameters.
+    pub fn rebuild_db(log: fn(string), elog: fn(string)) -> int is
+        let h: string = config::home()
+        let p: string = db_path()
+        let tmp_path: string = p + ".tmp"
+        fs::mkdir(path::parent(p))
+
+        let defexpr: string       = path::join(h, ".nix-defexpr")
+        let nix_profile: string   = path::join(h, ".nix-profile/bin")
+        let nix_store_bin: string = "/nix/var/nix/profiles/default/bin"
+        let cur_path: string      = env::get("PATH")
+        let new_path: string      = nix_profile + ":" + nix_store_bin + ":" + cur_path
+
+        let channels_nixpkgs: string = path::join(h, ".nix-defexpr/channels/nixpkgs")
+        let channels_dir: string     = path::join(h, ".nix-defexpr/channels")
+        let mut nix_path: string = channels_dir
+        if fs::exists(channels_nixpkgs) is
+            nix_path = "nixpkgs=" + channels_nixpkgs + ":" + channels_dir
+        end
+
+        log("nix-env -qaP --description  [NIX_DEFEXPR=" + defexpr + ", NIX_PATH=" + nix_path + "]")
+        log("writing to " + tmp_path)
+
+        let env_pairs: [string] = [
+            "PATH", new_path,
+            "NIX_PATH", nix_path,
+            "NIX_DEFEXPR", defexpr,
+            "NIXPKGS_ALLOW_UNFREE", "1",
+            "GC_INITIAL_HEAP_SIZE", "67108864",
+            "GC_MAXIMUM_HEAP_SIZE", "838860800",
+        ]
+        let shell_cmd: string = util::build_shell_cmd("nix-env", ["-qaP", "--description"], env_pairs)
+        let result = proc_run_cmd(shell_cmd, 0)
+
+        let mut out_lines: [string] = []
+        let mut count: int = 0
+        let raw_lines: [string] = str::split(result.stdout, "\n")
+        let mut i: int = 0
+        while i < raw_lines.len() is
+            let line: string = str::trim_end(raw_lines[i])
+            if line.len() > 0 is
+                let cols: [string] = str::splitn(str::trim_start(line), " ", 3)
+                ;; `--description` output is whitespace-separated, not
+                ;; tab-separated: splitn on a literal space is a close
+                ;; approximation of Rust's `splitn(3, char::is_whitespace)`
+                ;; since nix-env collapses runs of spaces for this output.
+                let mut attr: string = ""
+                let mut name_ver: string = ""
+                let mut description: string = ""
+                if cols.len() > 0 is attr = str::trim(cols[0]) end
+                if cols.len() > 1 is name_ver = str::trim(cols[1]) end
+                if cols.len() > 2 is description = str::trim(cols[2]) end
+
+                let nv: [string] = util::split_name_version(name_ver)
+                let name: string = nv[0]
+                let version: string = nv[1]
+
+                let clean_desc: string = str::join(str::split_whitespace(description), " ")
+
+                out_lines.push(attr + "\t" + name + "\t" + version + "\t" + clean_desc)
+                count = count + 1
+                if count % 5000 == 0 is
+                    log("  indexed " + to_string(count) + " packages...")
+                end
+            end
+            i = i + 1
+        end
+
+        if result.stderr.len() > 0 is
+            let err_lines: [string] = str::split(result.stderr, "\n")
+            let mut j: int = 0
+            while j < err_lines.len() is
+                let l: string = err_lines[j]
+                if l.len() > 0 is
+                    if str::index_of(l, "error:") >= 0 is
+                        elog(l)
+                    else is
+                        log(l)
+                    end
+                end
+                j = j + 1
+            end
+        end
+
+        if count == 0 is
+            fs::remove(tmp_path)
+            let defexpr_exists: bool  = fs::exists(defexpr)
+            let channels_exists: bool = fs::exists(channels_nixpkgs)
+            elog("nix-env -qaP produced no output.")
+            elog("  NIX_DEFEXPR exists: " + to_string(defexpr_exists) + "  (~/.nix-defexpr)")
+            elog("  channels/nixpkgs:   " + to_string(channels_exists) + "  (~/.nix-defexpr/channels/nixpkgs)")
+            elog("  Fix: run `hnm unpack` to register the nixpkgs channel, then `hnm update` again.")
+            return -1
+        end
+
+        fs::write(tmp_path, str::join(out_lines, "\n") + "\n")
+        fs::rename(tmp_path, p)
+
+        log("package index built: " + to_string(count) + " packages")
+        return count
+    end
+
+end
+
+;; ── from state.h# ──────────────────────────────────────
+;; state.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/state.rs
+;;
+;; ADAPTATION NOTE: the original keys installed packages by
+;; `HashMap<String, InstalledPkg>`. H#'s `std -> collections` HashMap
+;; is `string -> string` only (no struct values), so this port stores
+;; `installed` as a plain `[InstalledPkg]` array plus small linear-scan
+;; helpers (find/upsert/remove-by-name) — package counts here are at
+;; most a few hundred, so O(n) lookups are unobservable in practice.
+;;
+;; `Option<String>` fields (`pinned`, `description`) become plain
+;; `string`, with "" standing in for `None` — safe here since neither
+;; field is ever meaningfully the empty string for a real package.
+;; `DateTime<Utc>` becomes a unix timestamp (`int`), formatted with
+;; `std -> time` only where a human-readable string is displayed.
+
+
+mod state is
+
+    struct InstalledPkg is
+        pub name:         string
+        pub version:      string
+        pub attr_path:    string
+        pub installed_at: int    ;; unix timestamp — was DateTime<Utc>
+        pub pinned:       string ;; "" == None
+        pub description:  string ;; "" == None
+    end
+
+    struct State is
+        pub installed:    [InstalledPkg]
+        pub generation:   int
+        pub last_update:  int ;; unix timestamp, 0 == None
+    end
+
+    pub fn default_state() -> State is
+        return State { installed: [], generation: 0, last_update: 0 }
+    end
+
+    fn state_path() -> string is
+        return path::join(config::data_dir(), "state.json")
+    end
+
+    ;; ── serialization ────────────────────────────────────────────────
+
+    fn escape_json(s: string) -> string is
+        let mut out: string = str::replace_all(s, "\\", "\\\\")
+        out = str::replace_all(out, "\"", "\\\"")
+        out = str::replace_all(out, "\n", "\\n")
+        return out
+    end
+
+    fn pkg_to_json(p: InstalledPkg) -> string is
+        return "{\"name\":\"" + escape_json(p.name) + "\"," +
+               "\"version\":\"" + escape_json(p.version) + "\"," +
+               "\"attr_path\":\"" + escape_json(p.attr_path) + "\"," +
+               "\"installed_at\":" + to_string(p.installed_at) + "," +
+               "\"pinned\":\"" + escape_json(p.pinned) + "\"," +
+               "\"description\":\"" + escape_json(p.description) + "\"}"
+    end
+
+    fn state_to_json(st: State) -> string is
+        let mut items: [string] = []
+        let mut i: int = 0
+        while i < st.installed.len() is
+            items.push(pkg_to_json(st.installed[i]))
+            i = i + 1
+        end
+        return "{\n  \"generation\": " + to_string(st.generation) + ",\n" +
+               "  \"last_update\": " + to_string(st.last_update) + ",\n" +
+               "  \"installed\": [" + str::join(items, ", ") + "]\n}\n"
+    end
+
+    ;; Splits the raw text between an array's outer `[` `]` into its
+    ;; top-level `{...}` object chunks, via brace-depth counting (a
+    ;; string is never allowed to contain an unescaped literal `}` that
+    ;; would confuse depth-counting here, since `escape_json` above
+    ;; always escapes quotes/backslashes on the way out).
+    fn split_objects(arr_body: string) -> [string] is
+        let n: int = arr_body.len()
+        let mut i: int = 0
+        let mut depth: int = 0
+        let mut cur: string = ""
+        let mut out: [string] = []
+        while i < n is
+            let ch: string = arr_body[i..i + 1]
+            if ch == "{" is
+                depth = depth + 1
+                cur = cur + ch
+            else is
+                if ch == "}" is
+                    depth = depth - 1
+                    cur = cur + ch
+                    if depth == 0 is
+                        out.push(cur)
+                        cur = ""
+                    end
+                else is
+                    if depth > 0 is cur = cur + ch end
+                end
+            end
+            i = i + 1
+        end
+        return out
+    end
+
+    fn json_to_int(text: string, key: string) -> int is
+        let needle: string = "\"" + key + "\":"
+        let idx: int = str::index_of(text, needle)
+        if idx < 0 is return 0 end
+        let mut i: int = idx + needle.len()
+        let n: int = text.len()
+        let mut out: string = ""
+        while i < n is
+            let ch: string = text[i..i + 1]
+            if str::is_numeric(ch) || ch == "-" is
+                out = out + ch
+                i = i + 1
+            else is
+                i = n
+            end
+        end
+        if out.len() == 0 is return 0 end
+        return conv::str_to_int(out)
+    end
+
+    fn json_to_pkg(text: string) -> InstalledPkg is
+        return InstalledPkg {
+            name:         nixjson::field(text, "name"),
+            version:      nixjson::field(text, "version"),
+            attr_path:    nixjson::field(text, "attr_path"),
+            installed_at: json_to_int(text, "installed_at"),
+            pinned:       nixjson::field(text, "pinned"),
+            description:  nixjson::field(text, "description"),
+        }
+    end
+
+    fn state_from_json(raw: string) -> State is
+        let mut st: State = default_state()
+        st.generation  = json_to_int(raw, "generation")
+        st.last_update = json_to_int(raw, "last_update")
+
+        let arr_start: int = str::index_of(raw, "\"installed\":[")
+        if arr_start >= 0 is
+            let body_start: int = arr_start + "\"installed\":[".len()
+            let close: int = str::index_of(raw[body_start..raw.len()], "]")
+            ;; safe because no InstalledPkg field ever contains a raw
+            ;; (unescaped) ']' — description text is free-form but
+            ;; array-close scanning below is depth-based, not naive,
+            ;; so this is only used as an outer bound, not the parser.
+            let arr_body: string = raw[body_start..raw.len()]
+            let objs: [string] = split_objects(arr_body)
+            let mut i: int = 0
+            while i < objs.len() is
+                st.installed.push(json_to_pkg(objs[i]))
+                i = i + 1
+            end
+        end
+        return st
+    end
+
+    ;; ── public API ──────────────────────────────────────────────────
+
+    pub fn load() -> State is
+        let p: string = state_path()
+        if !fs::exists(p) is return default_state() end
+        return state_from_json(fs::read(p))
+    end
+
+    pub fn save(st: State) is
+        fs::mkdir(config::data_dir())
+        fs::write(state_path(), state_to_json(st))
+    end
+
+    fn find_index(st: State, name: string) -> int is
+        let mut i: int = 0
+        while i < st.installed.len() is
+            if st.installed[i].name == name is return i end
+            i = i + 1
+        end
+        return -1
+    end
+
+    pub fn is_installed(name: string) -> bool is
+        return find_index(load(), name) >= 0
+    end
+
+    ;; Returns a package with empty `.name` if not found (H# has no
+    ;; `Option<T>` return here in this port — callers check `.name`).
+    pub fn get(name: string) -> InstalledPkg is
+        let st: State = load()
+        let idx: int = find_index(st, name)
+        if idx < 0 is
+            return InstalledPkg { name: "", version: "", attr_path: "", installed_at: 0, pinned: "", description: "" }
+        end
+        return st.installed[idx]
+    end
+
+    pub fn add(pkg: InstalledPkg) is
+        let mut st: State = load()
+        let idx: int = find_index(st, pkg.name)
+        if idx >= 0 is
+            st.installed[idx] = pkg
+        else is
+            st.installed.push(pkg)
+        end
+        save(st)
+    end
+
+    pub fn remove(name: string) -> bool is
+        let mut st: State = load()
+        let idx: int = find_index(st, name)
+        if idx < 0 is return false end
+        st.installed.remove(idx)
+        save(st)
+        return true
+    end
+
+    pub fn list() -> [InstalledPkg] is
+        let st: State = load()
+        let mut v: [InstalledPkg] = st.installed
+        sort::sort_by_key(v, |p: any| -> any is return p.name end)
+        return v
+    end
+
+    pub fn pin(name: string, version: string) is
+        let mut st: State = load()
+        let idx: int = find_index(st, name)
+        if idx >= 0 is
+            st.installed[idx].pinned = version
+            save(st)
+        end
+    end
+
+    pub fn unpin(name: string) is
+        let mut st: State = load()
+        let idx: int = find_index(st, name)
+        if idx >= 0 is
+            st.installed[idx].pinned = ""
+            save(st)
+        end
+    end
+
+    ;; ── generation tracking ─────────────────────────────────────────
+    pub fn set_generation(gen: int) is
+        let mut st: State = load()
+        st.generation = gen
+        save(st)
+    end
+
+    ;; ── syncing with the real Nix profile ───────────────────────────
+    ;; Returns [added, removed].
+    pub fn sync_from_profile(profile_pkgs: [nix::Pkg]) -> [int] is
+        let mut st: State = load()
+
+        ;; drop anything HNM thinks is installed that the profile
+        ;; disagrees with
+        let before: int = st.installed.len()
+        let mut kept: [InstalledPkg] = []
+        let mut i: int = 0
+        while i < st.installed.len() is
+            let name: string = st.installed[i].name
+            let mut found: bool = false
+            let mut j: int = 0
+            while j < profile_pkgs.len() is
+                if profile_pkgs[j].name == name is found = true end
+                j = j + 1
+            end
+            if found is kept.push(st.installed[i]) end
+            i = i + 1
+        end
+        st.installed = kept
+        let removed: int = before - st.installed.len()
+
+        ;; add anything the profile has that HNM doesn't know about yet
+        let mut added: int = 0
+        let mut k: int = 0
+        while k < profile_pkgs.len() is
+            let pk: nix::Pkg = profile_pkgs[k]
+            if find_index(st, pk.name) < 0 is
+                let mut desc: string = pk.description
+                st.installed.push(InstalledPkg {
+                    name:         pk.name,
+                    version:      pk.version,
+                    attr_path:    pk.attr_path,
+                    installed_at: time::now_unix(),
+                    pinned:       "",
+                    description:  desc,
+                })
+                added = added + 1
+            end
+            k = k + 1
+        end
+
+        if added > 0 || removed > 0 is
+            save(st)
+        end
+        return [added, removed]
+    end
+
+end
+
+;; ── from shellrc.h# ──────────────────────────────────────
+;; shellrc.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/shellrc.rs
+
+
+
+mod shellrc is
+
+    fn rc_files() -> [string] is
+        return [".bashrc", ".zshrc", ".profile"]
+    end
+
+    ;; Locate the Nix profile activation script (nix.sh), if any.
+    ;; "" means none found (H# port convention — see PORTING-NOTES.md).
+    pub fn find_nix_sh() -> string is
+        let h: string = config::home()
+        let candidates: [string] = [
+            path::join(h, ".nix-profile/etc/profile.d/nix.sh"),
+            "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh",
+            "/etc/profile.d/nix.sh",
+            path::join(h, ".local/state/nix/profiles/profile/etc/profile.d/nix.sh"),
+            "/root/.nix-profile/etc/profile.d/nix.sh",
+        ]
+        let mut i: int = 0
+        while i < candidates.len() is
+            if fs::exists(candidates[i]) is return candidates[i] end
+            i = i + 1
+        end
+        return ""
+    end
+
+    fn block_for(profile_bin: string) -> string is
+        let nix_sh: string = find_nix_sh()
+        let mut nix_sh_line: string = ""
+        if nix_sh != "" is
+            nix_sh_line = "[ -f '" + nix_sh + "' ] && . '" + nix_sh + "'"
+        else is
+            nix_sh_line = "[ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \\\n    . ~/.nix-profile/etc/profile.d/nix.sh"
+        end
+        return "\n" + HNM_SHELLRC_MARKER + "\n" +
+               "export PATH=\"" + profile_bin + ":$HOME/.nix-profile/bin:$PATH\"\n" +
+               nix_sh_line + "\n"
+    end
+
+    ;; Append the HNM PATH block to every rc file that exists and isn't
+    ;; already patched. Returns the list of files that were newly patched.
+    pub fn patch(profile_bin: string) -> [string] is
+        let h: string = config::home()
+        let block: string = block_for(profile_bin)
+        let mut patched: [string] = []
+        let files: [string] = rc_files()
+
+        let mut i: int = 0
+        while i < files.len() is
+            let rc: string = files[i]
+            let rc_path: string = path::join(h, rc)
+            if fs::exists(rc_path) is
+                let content: string = fs::read(rc_path)
+                if str::index_of(content, HNM_SHELLRC_MARKER) >= 0 is
+                    output::dim("~/" + rc + " \xe2\x80\x94 already patched")
+                else is
+                    fs::append(rc_path, block)
+                    output::ok("patched ~/" + rc)
+                    patched.push(rc)
+                end
+            end
+            i = i + 1
+        end
+        return patched
+    end
+
+    ;; Remove the HNM block (marker line + the two lines after it) from
+    ;; every rc file that has it. Returns the list of files unpatched.
+    pub fn unpatch() -> [string] is
+        let h: string = config::home()
+        let mut unpatched: [string] = []
+        let files: [string] = rc_files()
+
+        let mut fi: int = 0
+        while fi < files.len() is
+            let rc: string = files[fi]
+            let rc_path: string = path::join(h, rc)
+            if fs::exists(rc_path) is
+                let content: string = fs::read(rc_path)
+                if str::index_of(content, HNM_SHELLRC_MARKER) >= 0 is
+                    let lines: [string] = str::split(content, "\n")
+                    let mut out_lines: [string] = []
+                    let mut skip_remaining: int = 0
+                    let mut li: int = 0
+                    while li < lines.len() is
+                        let line: string = lines[li]
+                        if skip_remaining > 0 is
+                            skip_remaining = skip_remaining - 1
+                        else is
+                            if str::trim(line) == HNM_SHELLRC_MARKER is
+                                skip_remaining = 2
+                            else is
+                                out_lines.push(line)
+                            end
+                        end
+                        li = li + 1
+                    end
+
+                    ;; collapse runs of blank lines left behind
+                    let mut cleaned: string = ""
+                    let mut prev_blank: bool = false
+                    let mut oi: int = 0
+                    while oi < out_lines.len() is
+                        let l: string = out_lines[oi]
+                        let is_blank: bool = str::trim(l) == ""
+                        if !(is_blank && prev_blank) is
+                            cleaned = cleaned + l + "\n"
+                        end
+                        prev_blank = is_blank
+                        oi = oi + 1
+                    end
+
+                    fs::write(rc_path, cleaned)
+                    output::ok("unpatched ~/" + rc)
+                    unpatched.push(rc)
+                end
+            end
+            fi = fi + 1
+        end
+        return unpatched
+    end
+
+end
+
+;; ── from nix.h# ──────────────────────────────────────
+;; nix.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/nix.rs — the core `nix-env` wrapper.
+;;
+;; See PORTING-NOTES.md for the two big adaptation decisions this file
+;; relies on: (1) `proc_run_cmd(cmd, timeout)` (compiler-injected, real
+;; exit codes) replaces `std::process::Command`, run through a single
+;; shell string built by `util::build_shell_cmd`; (2) nested JSON
+;; fields (`meta.description`, `meta.license.spdxId`, ...) are pulled
+;; out with the hand-rolled `nixjson` module instead of `serde_json`.
+
+
+mod nix is
+
+    struct Pkg is
+        pub name:        string
+        pub version:     string
+        pub attr_path:   string
+        pub description: string
+        pub homepage:    string ;; "" == None
+        pub license:     string ;; "" == None
+    end
+
+    ;; ── presence checks ─────────────────────────────────────────────
+
+    pub fn nix_ok() -> bool is
+        let r = proc_run_cmd("nix-env --version >/dev/null 2>&1", 10)
+        return r.exit_code == 0
+    end
+
+    pub fn ensure_nix() -> bool is
+        if nix_ok() is return true end
+        output::warn("Nix is not installed \xe2\x80\x94 bootstrapping automatically...")
+        return cmd_unpack::run()
+    end
+
+    ;; ── env setup ────────────────────────────────────────────────────
+    ;; Returns a flat [key, val, key, val, ...] array — see
+    ;; util::build_shell_cmd, which consumes exactly this shape.
+    ;;
+    ;; KEY INSIGHT (kept from the original): GC_INITIAL_HEAP_SIZE limits
+    ;; the Boehm GC heap used by the Nix evaluator. Default is 384 MiB —
+    ;; kept low here to avoid OOM on small machines.
+    pub fn pub_nix_env_vars() -> [string] is
+        let h: string = config::home()
+
+        let nix_profile_bin: string = path::join(h, ".nix-profile/bin")
+        let nix_default_bin: string = "/nix/var/nix/profiles/default/bin"
+        let cur_path: string = env::get("PATH")
+        let new_path: string = nix_profile_bin + ":" + nix_default_bin + ":" + cur_path
+
+        let channels_nixpkgs: string = path::join(h, ".nix-defexpr/channels/nixpkgs")
+        let channels_dir: string     = path::join(h, ".nix-defexpr/channels")
+        let mut nix_path: string = "nixpkgs=" + channels_dir
+        if fs::exists(channels_nixpkgs) is
+            nix_path = "nixpkgs=" + channels_nixpkgs + ":" + channels_dir
+        end
+
+        return [
+            "PATH", new_path,
+            "NIX_PATH", nix_path,
+            "NIXPKGS_ALLOW_UNFREE", "1",
+            "GC_INITIAL_HEAP_SIZE", "67108864",
+            "GC_MAXIMUM_HEAP_SIZE", "838860800",
+        ]
+    end
+
+    fn nix_env_vars() -> [string] is
+        return pub_nix_env_vars()
+    end
+
+    ;; Whether `systemd-run` is available, to memory-wrap nix-env calls.
+    fn has_systemd_run() -> bool is
+        let r = proc_run_cmd("systemd-run --version >/dev/null 2>&1", 10)
+        return r.exit_code == 0
+    end
+
+    ;; Build the full, safe nix-env shell command: proper NIX_PATH/GC
+    ;; env vars, `systemd-run --scope` memory wrapper if available,
+    ;; else an `ulimit -v` fallback — same two-path strategy as the
+    ;; original's `safe_nix_env_cmd`.
+    fn safe_nix_env_cmd(nix_args: [string]) -> string is
+        let env_vars: [string] = nix_env_vars()
+
+        if has_systemd_run() is
+            let wrapper_args: [string] = [
+                "--scope", "--user",
+                "-p", "MemoryMax=2G",
+                "-p", "MemorySwapMax=512M",
+                "--", "nix-env",
+            ]
+            let mut all_args: [string] = wrapper_args
+            let mut i: int = 0
+            while i < nix_args.len() is
+                all_args.push(nix_args[i])
+                i = i + 1
+            end
+            return util::build_shell_cmd("systemd-run", all_args, env_vars)
+        end
+
+        ;; no systemd-run: ulimit -v 2G fallback via sh -c
+        let mut quoted: [string] = []
+        let mut j: int = 0
+        while j < nix_args.len() is
+            quoted.push(util::shell_quote(nix_args[j]))
+            j = j + 1
+        end
+        let inner: string = "ulimit -v 2097152; exec nix-env " + str::join(quoted, " ")
+        return util::build_shell_cmd("sh", ["-c", inner], env_vars)
+    end
+
+    ;; ── search ───────────────────────────────────────────────────────
+    ;; Search uses the LOCAL package database (~/.local/share/hnm/pkgdb.tsv),
+    ;; built once by `hnm update`. Instantaneous, zero extra RAM.
+
+    pub fn search(query: string, task: progress::TaskProgress) -> [Pkg] is
+        if !fs::exists(pkgdb::db_path()) is
+            progress::warn(task, "package index not built yet")
+            progress::warn(task, "run `hnm update` first to build the local package index")
+            progress::log(task, "(this takes ~1-2 min but only needs to run once per update)")
+            return []
+        end
+
+        let count: int = pkgdb::entry_count()
+        progress::log(task, "searching local index (" + to_string(count) + " packages)...")
+        progress::set_msg(task, "searching " + to_string(count) + " packages")
+
+        let results: [pkgdb::Entry] = pkgdb::search(query)
+
+        ;; the local index (pkgdb.tsv) also stores a description column
+        ;; (see pkgdb::rebuild_db), so search results carry a real
+        ;; description — `hnm info <pkg>` still does a live nix-env
+        ;; query for homepage/license, which the bulk index doesn't carry.
+        let mut pkgs: [Pkg] = []
+        let mut i: int = 0
+        while i < results.len() is
+            let e: pkgdb::Entry = results[i]
+            let short: string = str::remove_prefix(e.attr, "nixpkgs.")
+            pkgs.push(Pkg {
+                name: short, version: e.version, attr_path: e.attr,
+                description: e.description, homepage: "", license: "",
+            })
+            i = i + 1
+        end
+
+        progress::inc(task, 100)
+        return pkgs
+    end
+
+    ;; ── nixpkgs config ──────────────────────────────────────────────
+    ;; Ensure ~/.config/nixpkgs/config.nix exists with allowUnfree = true
+    ;; (needed for steam/vscode/discord/etc). Idempotent.
+    pub fn ensure_nixpkgs_config() is
+        let config_dir: string  = path::join(path::join(config::home(), ".config"), "nixpkgs")
+        let config_file: string = path::join(config_dir, "config.nix")
+
+        if fs::exists(config_file) is
+            let contents: string = fs::read(config_file)
+            if str::index_of(contents, "allowUnfree") >= 0 is return end
+        end
+
+        fs::mkdir(config_dir)
+        fs::write(config_file, "{ allowUnfree = true; }\n")
+    end
+
+    ;; ── install ──────────────────────────────────────────────────────
+    ;; IMPORTANT: use -iA nixpkgs.<name> (attribute path), NOT -i <name>
+    ;; (bare name) — -iA evaluates only ONE attribute (small footprint);
+    ;; plain -i scans the entire nixpkgs tree and can OOM.
+
+    pub fn install(bare_name: string, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        fs::mkdir(path::parent(profile))
+
+        let attr: string = "nixpkgs." + bare_name
+        progress::log(task, "nix-env --profile " + profile + " -iA " + attr + "  [GC_INITIAL_HEAP_SIZE=64M]")
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "-iA", attr])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+
+        if !ok is
+            output::error("nix-env -iA " + attr + " failed \xe2\x80\x94 check that the package name is correct.")
+            output::dim("Tip: run `hnm search " + bare_name + "` first to find the exact attribute path")
+            return false
+        end
+        return true
+    end
+
+    ;; ── remove ───────────────────────────────────────────────────────
+
+    pub fn remove(pkg_name: string, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        progress::log(task, "nix-env --profile " + profile + " --uninstall " + pkg_name)
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "--uninstall", pkg_name])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+
+        if !ok is
+            output::error("nix-env --uninstall failed for '" + pkg_name + "'")
+            return false
+        end
+        return true
+    end
+
+    ;; ── update ───────────────────────────────────────────────────────
+
+    pub fn update_channel(task: progress::TaskProgress) -> bool is
+        let cfg: config::HnmConfig = config::load()
+        progress::log(task, "nix-channel --add " + cfg.nix_channel + " nixpkgs")
+        let add_cmd: string = util::build_shell_cmd("nix-channel", ["--add", cfg.nix_channel, "nixpkgs"], nix_env_vars())
+        proc_run_cmd(add_cmd, 0)
+
+        progress::set_msg(task, "nix-channel --update")
+        progress::log(task, "nix-channel --update")
+        let upd_cmd: string = util::build_shell_cmd("nix-channel", ["--update"], nix_env_vars())
+        let ok: bool = progress::run_cmd_log(task, upd_cmd, 0)
+
+        if !ok is
+            output::error("nix-channel --update failed")
+            return false
+        end
+        return true
+    end
+
+    ;; Upgrade a single package by attribute. Uses -iA which is O(1) in
+    ;; nixpkgs size — safe for low-RAM machines.
+    pub fn upgrade_one(pkg_name: string, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        let attr: string = "nixpkgs." + pkg_name
+        progress::log(task, "nix-env --profile " + profile + " -iA " + attr + "  [upgrade]")
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "-iA", attr])
+        return progress::run_cmd_log(task, cmd, 0)
+    end
+
+    ;; ── info ─────────────────────────────────────────────────────────
+
+    pub fn info(name: string) -> Pkg is
+        let attr: string = "nixpkgs." + name
+        let cmd: string = util::build_shell_cmd("nix-env", ["--query", "--available", "-A", attr, "--json"], nix_env_vars())
+        let r = proc_run_cmd(cmd, 60)
+
+        if r.exit_code == 0 && r.stdout.len() > 0 is
+            let unwrapped: [string] = nixjson::unwrap_single_entry(r.stdout)
+            let attr_key: string = unwrapped[0]
+            let body: string = unwrapped[1]
+            if attr_key != "" is
+                let mut pname: string = nixjson::field(body, "pname")
+                if pname == "" is pname = nixjson::field(body, "name") end
+                if pname == "" is pname = name end
+
+                let mut version: string = nixjson::field(body, "version")
+                if version == "" is version = "?" end
+
+                let meta: string = nixjson::object_field(body, "meta")
+                let mut description: string = nixjson::field(meta, "description")
+                if description == "" is description = nixjson::field(body, "description") end
+
+                let homepage: string = nixjson::field(meta, "homepage")
+
+                let license_obj: string = nixjson::object_field(meta, "license")
+                let mut license: string = ""
+                if license_obj != "" is
+                    license = nixjson::field(license_obj, "spdxId")
+                end
+                if license == "" is license = nixjson::field(meta, "license") end
+
+                return Pkg {
+                    name: pname, version: version, attr_path: attr_key,
+                    description: description, homepage: homepage, license: license,
+                }
+            end
+        end
+
+        output::error("package '" + name + "' not found \xe2\x80\x94 try `hnm search " + name + "`")
+        return Pkg { name: "", version: "", attr_path: "", description: "", homepage: "", license: "" }
+    end
+
+    ;; ── list installed ───────────────────────────────────────────────
+
+    pub fn list_profile() -> [Pkg] is
+        let profile: string = config::profile_dir()
+        let cmd: string = util::build_shell_cmd("nix-env", ["--profile", profile, "--query", "--installed", "--json"], nix_env_vars())
+        let r = proc_run_cmd(cmd, 60)
+
+        if r.exit_code != 0 is return [] end
+        let raw: string = str::trim(r.stdout)
+        if raw == "" || raw == "{}" is return [] end
+
+        let mut pkgs: [Pkg] = []
+        ;; the profile-query JSON is `{"<name>": {...}, "<name2>": {...}}`
+        ;; — a flat map of *possibly several* entries, unlike `info`'s
+        ;; guaranteed single entry, so it's walked manually here rather
+        ;; than via `unwrap_single_entry`.
+        let inner: string = raw[1..raw.len() - 1]
+        let mut pos: int = 0
+        while pos < inner.len() is
+            let rest: string = inner[pos..inner.len()]
+            let colon_brace: int = str::index_of(rest, "\":{")
+            if colon_brace < 0 is pos = inner.len() else is
+                let quote_before: int = str::index_of(rest, "\"")
+                let name: string = rest[quote_before + 1..colon_brace]
+
+                let mut i: int = colon_brace + 2
+                let mut depth: int = 0
+                let mut body: string = ""
+                let n: int = rest.len()
+                while i < n is
+                    let ch: string = rest[i..i + 1]
+                    body = body + ch
+                    if ch == "{" is depth = depth + 1 end
+                    if ch == "}" is
+                        depth = depth - 1
+                        if depth == 0 is i = n end
+                    end
+                    i = i + 1
+                end
+
+                let meta: string = nixjson::object_field(body, "meta")
+                let mut description: string = nixjson::field(meta, "description")
+                if description == "" is description = nixjson::field(body, "description") end
+                let mut version: string = nixjson::field(body, "version")
+                if version == "" is version = "?" end
+
+                pkgs.push(Pkg {
+                    name: name, version: version, attr_path: name,
+                    description: description, homepage: "", license: "",
+                })
+
+                pos = pos + colon_brace + 2 + body.len()
+            end
+        end
+
+        sort::sort_by_key(pkgs, |p: any| -> any is return p.name end)
+        return pkgs
+    end
+
+    ;; ── gc ───────────────────────────────────────────────────────────
+
+    pub fn gc(task: progress::TaskProgress) -> bool is
+        progress::log(task, "nix-store --gc")
+        let cmd: string = util::build_shell_cmd("nix-store", ["--gc"], nix_env_vars())
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+        if !ok is
+            output::error("nix-store --gc failed")
+            return false
+        end
+        return true
+    end
+
+    ;; ── generations ──────────────────────────────────────────────────
+    ;; Each row: [num_as_string, date, is_current_as_"true"/"false"].
+
+    pub fn list_generations() -> [[string]] is
+        let profile: string = config::profile_dir()
+        let cmd: string = util::build_shell_cmd("nix-env", ["--profile", profile, "--list-generations"], nix_env_vars())
+        let r = proc_run_cmd(cmd, 30)
+
+        let mut gens: [[string]] = []
+        let lines: [string] = str::split(r.stdout, "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let line: string = lines[i]
+            let parts: [string] = str::split_whitespace(line)
+            if parts.len() >= 2 is
+                let num: string = parts[0]
+                let date: string = parts[1]
+                let current: bool = str::index_of(line, "(current)") >= 0
+                let mut cur_s: string = "false"
+                if current is cur_s = "true" end
+                gens.push([num, date, cur_s])
+            end
+            i = i + 1
+        end
+        return gens
+    end
+
+    pub fn switch_generation(gen: int, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        progress::log(task, "nix-env --profile " + profile + " --switch-generation " + to_string(gen))
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "--switch-generation", to_string(gen)])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+        if !ok is
+            output::error("failed to switch to generation " + to_string(gen))
+            return false
+        end
+        return true
+    end
+
+    ;; The generation number nix-env currently has active. -1 == none.
+    pub fn current_generation() -> int is
+        let gens: [[string]] = list_generations()
+        let mut i: int = 0
+        while i < gens.len() is
+            if gens[i][2] == "true" is return conv::str_to_int(gens[i][0]) end
+            i = i + 1
+        end
+        return -1
+    end
+
+    ;; Delete all but the `keep` most recent generations (current one is
+    ;; always kept regardless of age). `keep == 0` disables pruning.
+    ;; Returns the number of generations actually deleted.
+    pub fn prune_old_generations(keep: int, task: progress::TaskProgress) -> int is
+        if keep == 0 is return 0 end
+
+        let mut gens: [[string]] = list_generations()
+        if gens.len() <= keep is return 0 end
+
+        sort::sort_by_key(gens, |g: any| -> any is return conv::str_to_int(g[0]) end)
+
+        let cutoff: int = gens.len() - keep
+        let mut to_delete: [string] = []
+        let mut i: int = 0
+        while i < cutoff is
+            if gens[i][2] != "true" is to_delete.push(gens[i][0]) end
+            i = i + 1
+        end
+
+        if to_delete.len() == 0 is return 0 end
+
+        let profile: string = config::profile_dir()
+        let list_arg: string = str::join(to_delete, " ")
+        progress::log(task, "nix-env --profile " + profile + " --delete-generations " + list_arg)
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "--delete-generations", list_arg])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+
+        if !ok is
+            output::error("nix-env --delete-generations failed")
+            return 0
+        end
+        return to_delete.len()
+    end
+
+    ;; ── store du ─────────────────────────────────────────────────────
+
+    pub fn store_du() -> string is
+        let r = proc_run_cmd("du -sh /nix/store 2>/dev/null", 30)
+        if r.exit_code != 0 is return "?" end
+        let parts: [string] = str::split_whitespace(r.stdout)
+        if parts.len() == 0 is return "?" end
+        return parts[0]
+    end
+
+end
+
+;; ── from cli.h# ──────────────────────────────────────
+;; cli.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/cli.rs
+;;
+;; ADAPTATION NOTE: the original uses the `lexopt` crate for a small,
+;; iterator-based argv parser. H# has no such crate; this port walks
+;; `env::args()` by hand with the same "first positional = subcommand,
+;; then per-subcommand flag/positional loop" shape lexopt gave it, so
+;; the accepted syntax (long flags, `-i`/`-f`/`-y`/`-V`/`-h` short
+;; flags, positionals) is unchanged.
+;;
+;; Rust's `enum Command { Search{..}, Install{..}, ... }` becomes a
+;; plain `CliCommand` struct with every possible field on it at once
+;; (H# enums, per its README, don't currently support per-variant
+;; payload fields the way Rust's do) — `kind` says which subcommand it
+;; is, and only the fields relevant to that `kind` are populated.
+
+
+mod cliapp is
+
+    struct CliCommand is
+        pub kind:        string ;; "search" | "install" | ... | "help" | "version" | "error"
+        pub error_msg:    string ;; populated when kind == "error"
+
+        pub query:        string ;; search
+        pub json:         bool   ;; search, list
+        pub packages:     [string] ;; install, remove, update
+        pub no_env:       bool   ;; install
+        pub force:        bool   ;; remove
+        pub package:      string ;; info, pin, unpin, which
+        pub installed:    bool   ;; list
+        pub sub:          string ;; env
+        pub yes:          bool   ;; env
+        pub generation:   int    ;; rollback (-1 == none given)
+        pub version_arg:  string ;; pin ("" == none given)
+    end
+
+    fn err(msg: string) -> CliCommand is
+        return blank_cmd_with("error", msg)
+    end
+
+    fn blank_cmd_with(kind: string, error_msg: string) -> CliCommand is
+        return CliCommand {
+            kind: kind, error_msg: error_msg,
+            query: "", json: false, packages: [], no_env: false, force: false,
+            package: "", installed: false, sub: "", yes: false,
+            generation: -1, version_arg: "",
+        }
+    end
+
+    fn blank_cmd(kind: string) -> CliCommand is
+        return blank_cmd_with(kind, "")
+    end
+
+    ;; Parse argv (excluding argv[0]) into a CliCommand. On malformed
+    ;; input, returns kind == "error" with error_msg set — callers
+    ;; print it via output::error and exit 1, exactly like the
+    ;; original's `Result<Opts>` did via `main`'s `Err(e)` arm.
+    pub fn parse() -> CliCommand is
+        let argv: [string] = env::args()
+        ;; argv[0] is the program path — real args start at index 1
+        let mut args: [string] = []
+        let mut i: int = 1
+        while i < argv.len() is
+            args.push(argv[i])
+            i = i + 1
+        end
+
+        if args.len() == 0 is
+            print_help()
+            return blank_cmd("__exit_ok")
+        end
+
+        let subcmd: string = args[0]
+        if subcmd == "--help" || subcmd == "-h" is return blank_cmd("help") end
+        if subcmd == "--version" || subcmd == "-V" is return blank_cmd("version") end
+
+        let rest: [string] = args[1..args.len()]
+
+        if subcmd == "search" is
+            let mut query: string = ""
+            let mut json: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--json" is json = true
+                else is
+                    if query == "" is query = a
+                    else is return err("unexpected argument: " + a) end
+                end
+                j = j + 1
+            end
+            if query == "" is return err("usage: hnm search <query> [--json]") end
+            let mut c: CliCommand = blank_cmd("search")
+            c.query = query
+            c.json = json
+            return c
+        end
+
+        if subcmd == "install" || subcmd == "i" is
+            let mut packages: [string] = []
+            let mut no_env: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--no-env" is no_env = true else is packages.push(a) end
+                j = j + 1
+            end
+            if packages.len() == 0 is return err("usage: hnm install <package> [<package>...]") end
+            let mut c: CliCommand = blank_cmd("install")
+            c.packages = packages
+            c.no_env = no_env
+            return c
+        end
+
+        if subcmd == "remove" || subcmd == "rm" || subcmd == "uninstall" is
+            let mut packages: [string] = []
+            let mut force: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--force" || a == "-f" is force = true else is packages.push(a) end
+                j = j + 1
+            end
+            if packages.len() == 0 is return err("usage: hnm remove <package> [<package>...]") end
+            let mut c: CliCommand = blank_cmd("remove")
+            c.packages = packages
+            c.force = force
+            return c
+        end
+
+        if subcmd == "update" || subcmd == "up" is
+            let mut c: CliCommand = blank_cmd("update")
+            c.packages = rest
+            return c
+        end
+
+        if subcmd == "upgrade" is return blank_cmd("upgrade") end
+        if subcmd == "unpack"  is return blank_cmd("unpack") end
+        if subcmd == "check"   is return blank_cmd("check") end
+
+        if subcmd == "info" is
+            if rest.len() == 0 is return err("usage: hnm info <package>") end
+            let mut c: CliCommand = blank_cmd("info")
+            c.package = rest[0]
+            return c
+        end
+
+        if subcmd == "list" || subcmd == "ls" is
+            let mut installed: bool = false
+            let mut json: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--installed" || a == "-i" is installed = true
+                else is
+                    if a == "--json" is json = true
+                    else is return err("unexpected argument: " + a) end
+                end
+                j = j + 1
+            end
+            let mut c: CliCommand = blank_cmd("list")
+            c.installed = installed
+            c.json = json
+            return c
+        end
+
+        if subcmd == "env" is
+            if rest.len() == 0 is return err("usage: hnm env <activate|deactivate|status> [--yes]") end
+            let sub: string = rest[0]
+            let mut yes: bool = false
+            let mut j: int = 1
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--yes" || a == "-y" is yes = true else is return err("unexpected argument: " + a) end
+                j = j + 1
+            end
+            let mut c: CliCommand = blank_cmd("env")
+            c.sub = sub
+            c.yes = yes
+            return c
+        end
+
+        if subcmd == "doctor" is return blank_cmd("doctor") end
+        if subcmd == "clean"  is return blank_cmd("clean") end
+
+        if subcmd == "rollback" is
+            let mut c: CliCommand = blank_cmd("rollback")
+            if rest.len() > 0 is
+                if !str::is_numeric(rest[0]) is return err("generation must be a number") end
+                c.generation = conv::str_to_int(rest[0])
+            end
+            return c
+        end
+
+        if subcmd == "pin" is
+            if rest.len() == 0 is return err("usage: hnm pin <package> [<version>]") end
+            let mut c: CliCommand = blank_cmd("pin")
+            c.package = rest[0]
+            if rest.len() > 1 is c.version_arg = rest[1] end
+            return c
+        end
+
+        if subcmd == "unpin" is
+            if rest.len() == 0 is return err("usage: hnm unpin <package>") end
+            let mut c: CliCommand = blank_cmd("unpin")
+            c.package = rest[0]
+            return c
+        end
+
+        if subcmd == "which" is
+            if rest.len() == 0 is return err("usage: hnm which <package>") end
+            let mut c: CliCommand = blank_cmd("which")
+            c.package = rest[0]
+            return c
+        end
+
+        if subcmd == "gc" is return blank_cmd("gc") end
+        if subcmd == "version" || subcmd == "--version" || subcmd == "-V" is return blank_cmd("version") end
+        if subcmd == "help"    || subcmd == "--help"    || subcmd == "-h" is return blank_cmd("help") end
+
+        return err("unknown command '" + subcmd + "'. Run `hnm help` for usage.")
+    end
+
+    fn cyan(s: string)        -> string is return "\x1b[36m" + s + "\x1b[0m" end
+    fn bright_cyan(s: string) -> string is return "\x1b[96m" + s + "\x1b[0m" end
+    fn bright_cyan_bold(s: string) -> string is return "\x1b[1;96m" + s + "\x1b[0m" end
+    fn bold_ul(s: string)     -> string is return "\x1b[1;4;96m" + s + "\x1b[0m" end
+    fn dim(s: string)         -> string is return "\x1b[2m" + s + "\x1b[0m" end
+
+    fn print_cmd_row(name: string, desc: string) is
+        write("  " + bright_cyan(fmt::pad_right(name, name.len() + 26)) + "  " + dim(desc))
+    end
+
+    pub fn print_help() is
+        write("")
+        write("  " + bright_cyan_bold("hnm") + "  " + cyan("HackerOS Nix Manager"))
+        write("  " + dim("v" + HNM_VERSION))
+        write("")
+        write(bold_ul("USAGE"))
+        write("  " + bright_cyan("hnm") + " " + cyan("<command>") + " " + dim("[options]"))
+        write("")
+        write(bold_ul("PACKAGE COMMANDS"))
+        print_cmd_row("search <query>",      "Search nixpkgs for packages")
+        print_cmd_row("install <pkg...>",    "Install one or more packages")
+        print_cmd_row("remove  <pkg...>",    "Remove one or more packages")
+        print_cmd_row("update  [pkg...]",    "Refresh channel and upgrade packages")
+        print_cmd_row("upgrade",             "Upgrade HNM itself (self-update from GitHub releases)")
+        print_cmd_row("info    <pkg>",       "Show package details")
+        print_cmd_row("list    [-i]",        "List available packages, or -i for installed only")
+        print_cmd_row("which   <pkg>",       "Show binary path of a package")
+        print_cmd_row("pin     <pkg> [ver]", "Pin package to a version")
+        print_cmd_row("unpin   <pkg>",       "Unpin a package")
+        print_cmd_row("rollback [gen]",      "Roll back to a previous generation")
+        print_cmd_row("gc",                  "Run Nix garbage collection")
+        write("")
+        write(bold_ul("SYSTEM COMMANDS"))
+        print_cmd_row("unpack",    "Bootstrap Nix (install + configure channel)")
+        print_cmd_row("check",     "Verify Nix installation (nix + nix-env versions)")
+        print_cmd_row("doctor",    "Full system diagnostics")
+        print_cmd_row("env <sub>", "Manage shell profile  [activate|deactivate|status] [-y]")
+        print_cmd_row("clean",     "Remove cached downloads and temp files")
+        print_cmd_row("version",   "Show HNM version info")
+        print_cmd_row("help",      "Show this help")
+        write("")
+        write(bold_ul("FLAGS"))
+        print_cmd_row("--json",            "Output as JSON (search, list)")
+        print_cmd_row("-i / --installed",  "list: show only HNM-tracked installed packages")
+        print_cmd_row("--no-env",          "install: skip the PATH activation hint at the end")
+        print_cmd_row("-f / --force",      "remove: skip the y/N confirmation prompt")
+        print_cmd_row("-y / --yes",        "env: patch/unpatch shell rc files instead of just printing")
+        write("")
+        write("  " + cyan("Docs:") + " " + dim("https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hnm.html"))
+        write("")
+    end
+
+end
+
+;; ── from commands/check.h# ──────────────────────────────────────
+;; commands/check.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/check.rs
+
+
+mod cmd_check is
+
+    pub fn run() -> bool is
+        output::header("Nix installation check")
+
+        let nix_r = proc_run_cmd("nix --version", 10)
+        if nix_r.exit_code == 0 is
+            output::ok("nix        " + str::trim(nix_r.stdout))
+        else is
+            output::warn("nix        NOT FOUND")
+            output::dim("Run `hnm unpack` to install Nix.")
+        end
+
+        let env_r = proc_run_cmd("nix-env --version", 10)
+        if env_r.exit_code == 0 is
+            output::ok("nix-env    " + str::trim(env_r.stdout))
+        else is
+            output::warn("nix-env    NOT FOUND")
+        end
+
+        let chan_r = proc_run_cmd("nix-channel --list", 10)
+        if chan_r.exit_code == 0 is
+            let v: string = str::trim(chan_r.stdout)
+            if v == "" is
+                output::warn("channels   (none registered)")
+                output::dim("Run `hnm unpack` to add nixpkgs-unstable.")
+            else is
+                output::ok("channels   " + str::replace_all(v, "\n", "  |  "))
+            end
+        else is
+            output::warn("nix-channel  NOT FOUND")
+        end
+
+        write("")
+        return true
+    end
+
+end
+
+;; ── from commands/clean.h# ──────────────────────────────────────
+;; commands/clean.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/clean.rs
+
+
+mod cmd_clean is
+
+    fn dir_size(p: string) -> int is
+        if fs::is_file(p) is return fs::size(p) end
+        let mut total: int = 0
+        if fs::is_dir(p) is
+            let names: [string] = fs::list_dir(p)
+            let mut i: int = 0
+            while i < names.len() is
+                total = total + dir_size(path::join(p, names[i]))
+                i = i + 1
+            end
+        end
+        return total
+    end
+
+    pub fn run() -> bool is
+        output::header("Clean HNM cache")
+
+        let cache_dir: string = path::join(path::join(config::home(), ".cache"), "hnm")
+        let mut freed: int = 0
+
+        if fs::exists(cache_dir) is
+            let size: int = dir_size(cache_dir)
+            fs::rmdir_all(cache_dir)
+            freed = freed + size
+            output::ok("removed " + cache_dir + "  (" + to_string(size) + " bytes)")
+        else is
+            output::dim(cache_dir + " \xe2\x80\x94 nothing to clean")
+        end
+
+        let nix_eval_cache: string = path::join(path::join(path::join(config::home(), ".cache"), "nix"), "eval-cache-v4")
+        if fs::exists(nix_eval_cache) is
+            let size: int = dir_size(nix_eval_cache)
+            fs::rmdir_all(nix_eval_cache)
+            freed = freed + size
+            output::ok("removed nix eval cache  (" + to_string(size) + " bytes)")
+        end
+
+        write("")
+        if freed > 0 is
+            let tenths: int = (freed * 10) / 1048576
+            let whole: int = tenths / 10
+            let frac: int = tenths % 10
+            output::ok("freed " + to_string(freed) + " bytes (" + to_string(whole) + "." + to_string(frac) + " MB)")
+        else is
+            output::ok("nothing to clean \xe2\x80\x94 cache is already empty")
+        end
+
+        output::dim("To free Nix store space, run:  hnm gc")
+        return true
+    end
+
+end
+
+;; ── from commands/gc.h# ──────────────────────────────────────
+;; commands/gc.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/gc.rs
+
+mod cmd_gc is
+
+    pub fn run() -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Nix garbage collection")
+
+        let before: string = nix::store_du()
+        output::label("store size before", before)
+        write("")
+
+        let task: progress::TaskProgress = progress::task(100, "running nix-store --gc")
+        progress::log(task, "nix-store --gc")
+        let ok: bool = nix::gc(task)
+        if !ok is return false end
+        progress::finish_ok(task, "garbage collection complete")
+
+        write("")
+        let after: string = nix::store_du()
+        output::label("store size after", after)
+        output::ok("done")
+        return true
+    end
+
+end
+
+;; ── from commands/which.h# ──────────────────────────────────────
+;; commands/which.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/which.rs
+
+
+mod cmd_which is
+
+    pub fn run(package: string) -> bool is
+        let profile_bin: string = path::join(path::join(config::profile_dir(), "bin"), package)
+
+        if fs::exists(profile_bin) is
+            output::ok(profile_bin)
+            return true
+        end
+
+        let r = proc_run_cmd("which " + util::shell_quote(package) + " 2>/dev/null", 10)
+        if r.exit_code == 0 is
+            output::ok(str::trim(r.stdout))
+            return true
+        end
+
+        if state::is_installed(package) is
+            let bin_dir: string = path::join(config::profile_dir(), "bin")
+            output::warn("'" + package + "' is installed but its binary was not found in " + bin_dir)
+            output::dim("The package may provide binaries under different names.")
+            output::dim("Check: ls " + bin_dir)
+            return true
+        end
+
+        output::error("'" + package + "' is not installed \xe2\x80\x94 run `hnm install " + package + "`")
+        return false
+    end
+
+end
+
+;; ── from commands/info.h# ──────────────────────────────────────
+;; commands/info.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/info.rs
+
+
+mod cmd_info is
+
+    pub fn run(package: string) -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Package info \xe2\x80\x94 " + package)
+
+        let pkg: nix::Pkg = nix::info(package)
+        if pkg.name == "" is return false end ;; nix::info already printed the error
+
+        output::label("name",    pkg.name)
+        output::label("version", pkg.version)
+        output::label("attr",    pkg.attr_path)
+        if pkg.description != "" is output::label("description", pkg.description) end
+        if pkg.homepage    != "" is output::label("homepage", pkg.homepage) end
+        if pkg.license     != "" is output::label("license", pkg.license) end
+
+        let installed: bool = state::is_installed(package)
+        let mut installed_label: string = "no"
+        if installed is installed_label = "yes \xe2\x9c\x93" end
+        output::label("installed", installed_label)
+
+        let p: state::InstalledPkg = state::get(package)
+        if p.name != "" is
+            output::label("installed at", time::format(p.installed_at, "%Y-%m-%d %H:%M UTC"))
+            if p.pinned != "" is output::label("pinned to", p.pinned) end
+        end
+
+        write("")
+        if !installed is
+            output::dim("hnm install " + package + "   to install")
+        end
+        return true
+    end
+
+end
+
+;; ── from commands/pin.h# ──────────────────────────────────────
+;; commands/pin.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/pin.rs
+
+mod cmd_pin is
+
+    pub fn run(package: string, version_arg: string) -> bool is
+        if !nix::ensure_nix() is return false end
+
+        if !state::is_installed(package) is
+            output::error("'" + package + "' is not installed \xe2\x80\x94 install it first with `hnm install " + package + "`")
+            return false
+        end
+
+        let mut pin_ver: string = version_arg
+        if pin_ver == "" is
+            let p: state::InstalledPkg = state::get(package)
+            pin_ver = "?"
+            if p.name != "" is pin_ver = p.version end
+        end
+
+        state::pin(package, pin_ver)
+
+        output::ok("pinned '" + package + "' to version '" + pin_ver + "'")
+        output::dim("Pinned packages will not be updated by `hnm update`.")
+        return true
+    end
+
+end
+
+;; ── from commands/unpin.h# ──────────────────────────────────────
+;; commands/unpin.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/unpin.rs
+
+mod cmd_unpin is
+
+    pub fn run(package: string) -> bool is
+        if !nix::ensure_nix() is return false end
+
+        if !state::is_installed(package) is
+            output::error("'" + package + "' is not installed")
+            return false
+        end
+
+        state::unpin(package)
+        output::ok("'" + package + "' is now unpinned \xe2\x80\x94 it will be updated by `hnm update`")
+        return true
+    end
+
+end
+
+;; ── from commands/search.h# ──────────────────────────────────────
+;; commands/search.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/search.rs
+;;
+;; ADAPTATION NOTE: `--json` in the original pretty-prints via
+;; serde_json. This port emits equivalent flat-ish JSON built by hand
+;; (see PORTING-NOTES.md re: no generic serializer in H#).
+
+
+mod cmd_search is
+
+    fn pkg_json(p: nix::Pkg) -> string is
+        return "{\"name\":\"" + p.name + "\",\"version\":\"" + p.version +
+               "\",\"attr_path\":\"" + p.attr_path + "\",\"description\":\"" + p.description + "\"}"
+    end
+
+    pub fn run(query: string, json: bool) -> bool is
+        if !nix::ensure_nix() is return false end
+
+        let task: progress::TaskProgress = progress::task(100, "searching for '" + query + "'")
+        let results: [nix::Pkg] = nix::search(query, task)
+        progress::finish_ok(task, "done")
+        write("")
+
+        if results.len() == 0 is
+            output::warn("no packages found matching '" + query + "'")
+            return true
+        end
+
+        if json is
+            let mut rows: [string] = []
+            let mut i: int = 0
+            while i < results.len() is
+                rows.push(pkg_json(results[i]))
+                i = i + 1
+            end
+            write("[\n  " + str::join(rows, ",\n  ") + "\n]")
+            return true
+        end
+
+        output::header("Search  '" + query + "'   (" + to_string(results.len()) + " results)")
+        output::table_header()
+
+        let mut j: int = 0
+        while j < results.len() is
+            let p: nix::Pkg = results[j]
+            output::table_row(p.name, p.version, p.description, state::is_installed(p.name))
+            j = j + 1
+        end
+
+        write("")
+        output::dim("hnm install <package>   to install")
+        output::dim("hnm info    <package>   for details")
+        return true
+    end
+
+end
+
+;; ── from commands/doctor.h# ──────────────────────────────────────
+;; commands/doctor.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/doctor.rs
+
+
+mod cmd_doctor is
+
+    fn check_bin(bin: string, args_str: string, counter: int) -> int is
+        let r = proc_run_cmd(bin + " " + args_str, 10)
+        if r.exit_code == 0 is
+            output::ok(fmt::pad_right(bin, 14) + " " + str::trim(r.stdout))
+            return counter
+        end
+        output::warn(fmt::pad_right(bin, 14) + " NOT FOUND")
+        return counter + 1
+    end
+
+    pub fn run() -> bool is
+        output::header("HNM Doctor \xe2\x80\x94 system diagnostics")
+
+        let mut warnings: int = 0
+        let mut errors: int = 0
+
+        errors = check_bin("nix", "--version", errors)
+        errors = check_bin("nix-env", "--version", errors)
+        errors = check_bin("nix-channel", "--version", errors)
+        warnings = check_bin("nix-store", "--version", warnings)
+
+        write("")
+        let chan_r = proc_run_cmd("nix-channel --list", 10)
+        if chan_r.exit_code == 0 is
+            let raw: string = str::trim(chan_r.stdout)
+            if raw == "" is
+                output::warn("no Nix channels registered  \xe2\x86\x92  run `hnm unpack`")
+                warnings = warnings + 1
+            else is
+                output::ok("channels   " + str::replace_all(raw, "\n", "  |  "))
+            end
+        else is
+            output::warn("could not list channels")
+            warnings = warnings + 1
+        end
+
+        let profile: string = config::profile_dir()
+        if fs::exists(profile) is
+            output::ok("profile    " + profile)
+        else is
+            output::warn("profile dir not found: " + profile + "  (ok if no packages installed yet)")
+        end
+
+        if fs::exists("/nix/store") is
+            output::ok("/nix/store  exists   (" + nix::store_du() + ")")
+        else is
+            output::warn("/nix/store does not exist \xe2\x80\x94 Nix may not be installed")
+            warnings = warnings + 1
+        end
+
+        write("")
+        let st: state::State = state::load()
+        output::ok("state      " + to_string(st.installed.len()) + " package(s) tracked")
+
+        ;; read-only drift check between state.json and the real
+        ;; nix-env profile
+        let profile_pkgs: [nix::Pkg] = nix::list_profile()
+        let mut missing_from_state: int = 0
+        let mut i: int = 0
+        while i < profile_pkgs.len() is
+            let mut found: bool = false
+            let mut j: int = 0
+            while j < st.installed.len() is
+                if st.installed[j].name == profile_pkgs[i].name is found = true end
+                j = j + 1
+            end
+            if !found is missing_from_state = missing_from_state + 1 end
+            i = i + 1
+        end
+        let mut stale_in_state: int = 0
+        let mut k: int = 0
+        while k < st.installed.len() is
+            let mut found2: bool = false
+            let mut m: int = 0
+            while m < profile_pkgs.len() is
+                if profile_pkgs[m].name == st.installed[k].name is found2 = true end
+                m = m + 1
+            end
+            if !found2 is stale_in_state = stale_in_state + 1 end
+            k = k + 1
+        end
+        if missing_from_state > 0 || stale_in_state > 0 is
+            output::warn("state drift: " + to_string(missing_from_state) + " untracked in profile, " +
+                         to_string(stale_in_state) + " stale in state.json  \xe2\x86\x92  run `hnm list -i`")
+            warnings = warnings + 1
+        end
+
+        let cfg: config::HnmConfig = config::load()
+        output::ok("config     channel = " + cfg.nix_channel)
+
+        write("")
+        let path_var: string = env::get("PATH")
+        if str::index_of(path_var, ".nix-profile") >= 0 is
+            output::ok("PATH       contains .nix-profile")
+        else is
+            output::warn("PATH does not include ~/.nix-profile/bin")
+            output::dim("Add to your shell rc:  . ~/.nix-profile/etc/profile.d/nix.sh")
+            warnings = warnings + 1
+        end
+
+        write("")
+        if errors == 0 && warnings == 0 is
+            output::ok("all checks passed \xe2\x80\x94 HNM is healthy")
+        else is
+            if errors > 0 is output::warn(to_string(errors) + " error(s) found") end
+            if warnings > 0 is output::dim(to_string(warnings) + " warning(s) \xe2\x80\x94 see above") end
+        end
+
+        return true
+    end
+
+end
+
+;; ── from commands/env.h# ──────────────────────────────────────
+;; commands/env.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/env.rs
+
+
+mod cmd_env is
+
+    pub fn run(sub: string, yes: bool) -> bool is
+        if sub == "activate"   is return activate(yes) end
+        if sub == "deactivate" is return deactivate(yes) end
+        if sub == "status"     is return status() end
+        output::error("unknown env subcommand '" + sub + "' \xe2\x80\x94 use activate | deactivate | status")
+        return false
+    end
+
+    fn activate(yes: bool) -> bool is
+        output::header("Activate HNM profile")
+
+        let profile: string = config::profile_dir()
+        let bin_dir: string = path::join(profile, "bin")
+
+        if yes is
+            output::info("patching shell rc files (~/.bashrc, ~/.zshrc, ~/.profile)...")
+            write("")
+            let patched: [string] = shellrc::patch(bin_dir)
+            write("")
+            if patched.len() == 0 is
+                output::info("nothing to patch \xe2\x80\x94 already activated, or no rc files found")
+            else is
+                output::ok("patched: " + str::join(patched, ", "))
+                output::dim("Reload your shell (or open a new terminal) to apply.")
+            end
+            return true
+        end
+
+        output::info("Add the following to your ~/.bashrc or ~/.zshrc:")
+        write("")
+        write("  # HNM + Nix")
+        write("  export PATH=\"" + bin_dir + ":$PATH\"")
+
+        let nix_sh: string = shellrc::find_nix_sh()
+        if nix_sh != "" is
+            write("  [ -f '" + nix_sh + "' ] && . '" + nix_sh + "'")
+        else is
+            write("  [ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \\")
+            write("      . ~/.nix-profile/etc/profile.d/nix.sh")
+        end
+
+        write("")
+        output::info("To activate for the CURRENT session only (copy & run):")
+        write("")
+        write("  export PATH=\"" + bin_dir + ":$PATH\"")
+        if nix_sh != "" is
+            write("  . '" + nix_sh + "'")
+        end
+
+        write("")
+        output::dim("Tip: run `hnm env activate --yes` to patch these files automatically.")
+        write("")
+
+        if fs::exists(bin_dir) is
+            let bins: [string] = fs::list_dir(bin_dir)
+            if bins.len() > 0 is
+                output::dim("binaries in profile: " + str::join(bins, "  "))
+            else is
+                output::dim("profile/bin is empty \xe2\x80\x94 this is unexpected after install")
+            end
+        else is
+            output::warn("profile/bin does not exist yet \xe2\x80\x94 install a package first")
+        end
+
+        write("")
+        return true
+    end
+
+    fn deactivate(yes: bool) -> bool is
+        output::header("Deactivate HNM profile")
+        let profile: string = config::profile_dir()
+
+        if yes is
+            output::info("removing the HNM block from shell rc files...")
+            write("")
+            let unpatched: [string] = shellrc::unpatch()
+            write("")
+            if unpatched.len() == 0 is
+                output::info("nothing to remove \xe2\x80\x94 no rc file had an HNM block")
+            else is
+                output::ok("unpatched: " + str::join(unpatched, ", "))
+                output::dim("Restart your shell (or open a new terminal) to apply.")
+            end
+            return true
+        end
+
+        output::info("Remove this block from your ~/.bashrc or ~/.zshrc:")
+        write("")
+        write("  " + HNM_SHELLRC_MARKER)
+        write("  export PATH=\"" + path::join(profile, "bin") + ":$PATH\"")
+        write("  [ -f ... ] && . ...   # nix.sh sourcing line")
+        write("")
+        output::dim("Tip: run `hnm env deactivate --yes` to do this automatically.")
+        write("")
+        output::ok("done \xe2\x80\x94 restart your shell to apply")
+        return true
+    end
+
+    fn status() -> bool is
+        output::header("HNM environment status")
+
+        let profile: string = config::profile_dir()
+        let bin_dir: string = path::join(profile, "bin")
+
+        output::label("profile dir", profile)
+        output::label("bin dir", bin_dir)
+
+        let path_var: string = env::get("PATH")
+        let parts: [string] = str::split(path_var, ":")
+        let mut in_path: bool = false
+        let mut i: int = 0
+        while i < parts.len() is
+            if parts[i] == bin_dir is in_path = true end
+            i = i + 1
+        end
+        let mut in_path_label: string = "no \xe2\x80\x94 run `hnm env activate`"
+        if in_path is in_path_label = "yes \xe2\x9c\x93" end
+        output::label("in PATH", in_path_label)
+
+        let mut nix_profile_label: string = "not sourced"
+        if str::index_of(path_var, ".nix-profile") >= 0 is nix_profile_label = "sourced \xe2\x9c\x93" end
+        output::label("nix profile", nix_profile_label)
+
+        let h: string = config::home()
+        let rc_names: [string] = [".bashrc", ".zshrc", ".profile"]
+        let mut patched_files: [string] = []
+        let mut j: int = 0
+        while j < rc_names.len() is
+            let rc: string = rc_names[j]
+            let p: string = path::join(h, rc)
+            if fs::exists(p) is
+                let content: string = fs::read(p)
+                if str::index_of(content, HNM_SHELLRC_MARKER) >= 0 is patched_files.push(rc) end
+            end
+            j = j + 1
+        end
+        let mut patched_label: string = "none (run `hnm env activate --yes`)"
+        if patched_files.len() > 0 is patched_label = str::join(patched_files, ", ") end
+        output::label("rc files patched", patched_label)
+
+        if fs::exists(bin_dir) is
+            let bins: [string] = fs::list_dir(bin_dir)
+            if bins.len() > 0 is
+                let mut shown: [string] = []
+                let mut k: int = 0
+                while k < bins.len() && k < 20 is
+                    shown.push(bins[k])
+                    k = k + 1
+                end
+                output::label("binaries", str::join(shown, ", "))
+            end
+        end
+
+        let default_profile_bin: string = path::join(path::join(config::home(), ".nix-profile"), "bin")
+        if fs::exists(default_profile_bin) is
+            output::label("~/.nix-profile/bin", "exists (may also contain packages)")
+        end
+
+        write("")
+        return true
+    end
+
+end
+
+;; ── from commands/unpack.h# ──────────────────────────────────────
+;; commands/unpack.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/unpack.rs
+;;
+;; ADAPTATION NOTE: the original checks `libc::geteuid() == 0` for the
+;; root warning. H# has no libc FFI wired up for this in the stdlib, so
+;; this port shells out to the POSIX `id -u` utility instead (`0` means
+;; root) — same information, no native binding needed.
+;;
+;; The original also runs the Nix installer with `Stdio::inherit()` so
+;; its output streams live to the user's terminal. `proc_run_cmd`
+;; captures output rather than inheriting stdio (see PORTING-NOTES.md),
+;; so this port prints the captured installer output in full once it
+;; completes, instead of it appearing live line-by-line.
+
+
+mod cmd_unpack is
+
+    fn has_bin(name: string) -> bool is
+        let r = proc_run_cmd("which " + util::shell_quote(name) + " >/dev/null 2>&1", 10)
+        return r.exit_code == 0
+    end
+
+    ;; H#'s `std -> os` module exposes this as a real builtin
+    ;; (__builtin_os_is_root, a direct geteuid() check) — no shelling
+    ;; out needed here, unlike some of this port's other adaptations.
+
+    ;; Flat [key, val, ...] env vars for the channel-registration step
+    ;; (mirrors the original's `nix_path_env`).
+    fn nix_path_env() -> [string] is
+        let h: string = config::home()
+        let nix_bin: string = path::join(h, ".nix-profile/bin")
+        let nix_store_bin: string = "/nix/var/nix/profiles/default/bin"
+        let cur: string = env::get("PATH")
+        return [
+            "PATH", nix_bin + ":" + nix_store_bin + ":" + cur,
+            "NIXPKGS_ALLOW_UNFREE", "1",
+        ]
+    end
+
+    pub fn run() -> bool is
+        output::header("Bootstrap Nix  (hnm unpack)")
+
+        if os::is_root() is
+            output::warn("Running as root (sudo).")
+            output::dim("Nix single-user install works best as a regular user.")
+            output::dim("If install fails, try: su - youruser && hnm unpack")
+            write("")
+        end
+
+        ;; ── Step 1 — install Nix ─────────────────────────────────────
+        if nix::nix_ok() is
+            output::ok("Nix is already installed \xe2\x80\x94 skipping download")
+        else is
+            let mut dl: string = ""
+            if has_bin("curl") is dl = "curl -fsSL https://nixos.org/nix/install"
+            else is
+                if has_bin("wget") is dl = "wget -qO- https://nixos.org/nix/install" end
+            end
+
+            if dl == "" is
+                output::warn("Neither curl nor wget found.")
+                output::dim("Install one first:")
+                output::dim("  apt-get install curl   # Debian/Ubuntu")
+                output::dim("  dnf install curl       # Fedora/RHEL")
+                output::dim("  pacman -S curl         # Arch")
+                output::error("curl/wget not found")
+                return false
+            end
+
+            let task: progress::TaskProgress = progress::task(100, "installing nix")
+
+            if os::is_root() is
+                progress::warn(task, "running as root \xe2\x80\x94 Nix single-user install may have issues")
+                progress::warn(task, "recommend: run `hnm unpack` as a regular user instead")
+            end
+
+            let install_sh: string = dl + " | sh -s -- --no-daemon"
+            let r = proc_run_cmd(install_sh, 0)
+            progress::inc(task, 80)
+
+            if r.exit_code == 0 is
+                progress::inc(task, 20)
+                progress::finish_ok(task, "Nix installed")
+            else is
+                progress::finish_err(task, "installer exited with code " + to_string(r.exit_code))
+                output::warn("Checking if nix-env works anyway...")
+                proc_run_cmd(". /root/.nix-profile/etc/profile.d/nix.sh 2>/dev/null || . ~/.nix-profile/etc/profile.d/nix.sh 2>/dev/null; nix-env --version", 15)
+
+                if !nix::nix_ok() is
+                    write("")
+                    output::warn("Root install failed. Recommended fix:")
+                    output::dim("  1) Switch to a regular (non-root) user:")
+                    output::dim("       su - youruser")
+                    output::dim("  2) Run unpack as that user:")
+                    output::dim("       hnm unpack")
+                    output::dim("")
+                    output::dim("If you MUST use root, install dependencies first:")
+                    output::dim("  groupadd -r nixbld")
+                    output::dim("  for i in $(seq 1 32); do")
+                    output::dim("    useradd -g nixbld -G nixbld -M -N -r -s /sbin/nologin nixbld$i")
+                    output::dim("  done")
+                    output::dim("  Then run `hnm unpack` again.")
+                    output::error("Nix installation failed")
+                    return false
+                end
+                output::ok("nix-env works \xe2\x80\x94 continuing")
+            end
+        end
+
+        ;; ── Step 2 — report nix.sh location ─────────────────────────
+        let nix_sh: string = shellrc::find_nix_sh()
+        if nix_sh != "" is
+            output::ok("nix profile script: " + nix_sh)
+        else is
+            output::warn("nix.sh not found \xe2\x80\x94 you may need to open a new shell first")
+        end
+
+        ;; ── Step 3 — register nixpkgs-unstable channel ──────────────
+        let env_vars: [string] = nix_path_env()
+        let task2: progress::TaskProgress = progress::task(100, "registering nixpkgs channel")
+        progress::log(task2, "nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs")
+
+        let add_ok: bool = progress::run_with_log_env(task2, "nix-channel",
+            ["--add", "https://nixos.org/channels/nixpkgs-unstable", "nixpkgs"], env_vars)
+        if !add_ok is
+            progress::warn(task2, "nix-channel --add returned non-zero (may already be set)")
+        end
+        progress::inc(task2, 30)
+
+        progress::set_msg(task2, "nix-channel --update")
+        progress::log(task2, "nix-channel --update")
+        let ok: bool = progress::run_with_log_env(task2, "nix-channel", ["--update"], env_vars)
+        progress::inc(task2, 70)
+
+        if ok is
+            progress::finish_ok(task2, "nixpkgs-unstable channel registered")
+        else is
+            progress::finish_err(task2, "nix-channel --update failed")
+            output::dim("Check internet connection, then run `hnm unpack` again.")
+            return false
+        end
+
+        ;; ── Step 4 — patch shell rc files ───────────────────────────
+        write("")
+        output::info("Patching shell RC files...")
+        shellrc::patch(path::join(config::profile_dir(), "bin"))
+
+        ;; ── Done ─────────────────────────────────────────────────────
+        write("")
+        output::ok("Nix is ready!")
+        write("")
+        output::info("Reload your shell:")
+        write("  source ~/.bashrc    # bash")
+        write("  source ~/.zshrc     # zsh")
+        write("  exec $SHELL         # any shell")
+        write("")
+        output::dim("Verify:          hnm check")
+        output::dim("Build pkg index: hnm update   (run once, takes ~2 min)")
+        output::dim("Search:          hnm search <package>")
+
+        return true
+    end
+
+end
+
+;; ── from commands/install.h# ──────────────────────────────────────
+;; commands/install.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/install.rs
+
+
+mod cmd_install is
+
+    fn strip_nixpkgs_prefix(s: string) -> string is
+        if str::index_of(s, "nixpkgs.") == 0 is return s[8..s.len()] end
+        if str::index_of(s, "nixpkgs#") == 0 is return s[8..s.len()] end
+        return s
+    end
+
+    pub fn run(packages: [string], no_env: bool) -> bool is
+        if packages.len() == 0 is
+            output::error("usage: hnm install <package> [<package>...]")
+            return false
+        end
+
+        if !nix::ensure_nix() is return false end
+        nix::ensure_nixpkgs_config()
+        output::header("Installing " + to_string(packages.len()) + " package(s)")
+
+        let mut failed: [string] = []
+
+        let mut idx: int = 0
+        while idx < packages.len() is
+            let pkg_name: string = packages[idx]
+            write("")
+            output::step(to_string(idx + 1) + "/" + to_string(packages.len()), "installing  " + pkg_name)
+
+            if state::is_installed(pkg_name) is
+                output::warn("'" + pkg_name + "' is already installed \xe2\x80\x94 skipping")
+                idx = idx + 1
+            else is
+                let bare: string = strip_nixpkgs_prefix(pkg_name)
+
+                let task: progress::TaskProgress = progress::task(100, "nix-env -iA nixpkgs." + bare)
+                progress::log(task, "nix-env -iA nixpkgs." + bare + "  [NIXPKGS_ALLOW_UNFREE=1]")
+                progress::set_msg(task, "installing nixpkgs." + bare + " ...")
+
+                let ok: bool = nix::install(bare, task)
+                progress::inc(task, 90)
+
+                if ok is
+                    ;; same nix-env -qa lookup for version *and* description
+                    let info: nix::Pkg = nix::info(bare)
+                    let mut version: string = "?"
+                    let mut description: string = ""
+                    if info.name != "" is
+                        version = info.version
+                        description = info.description
+                    end
+
+                    let pkg: state::InstalledPkg = state::InstalledPkg {
+                        name: pkg_name, version: version,
+                        attr_path: "nixpkgs." + bare,
+                        installed_at: time::now_unix(),
+                        pinned: "", description: description,
+                    }
+                    state::add(pkg)
+                    progress::inc(task, 10)
+                    progress::finish_ok(task, pkg_name + " " + version)
+                else is
+                    progress::finish_err(task, "install failed")
+                    failed.push(pkg_name)
+                end
+                idx = idx + 1
+            end
+        end
+
+        write("")
+        if failed.len() > 0 is
+            output::warn(to_string(failed.len()) + " package(s) failed")
+            output::error("failed: " + str::join(failed, ", "))
+            return false
+        end
+
+        output::ok("all packages installed successfully")
+
+        let gen: int = nix::current_generation()
+        if gen >= 0 is state::set_generation(gen) end
+
+        let cfg: config::HnmConfig = config::load()
+        if cfg.max_generations > 0 is
+            let task: progress::TaskProgress = progress::task(1, "pruning old generations")
+            let n: int = nix::prune_old_generations(cfg.max_generations, task)
+            if n > 0 is
+                output::dim("pruned " + to_string(n) + " old generation(s) (max_generations = " + to_string(cfg.max_generations) + ")")
+            end
+        end
+
+        if !no_env is
+            write("")
+            let profile_bin: string = path::join(config::profile_dir(), "bin")
+            let default_bin: string = path::join(path::join(config::home(), ".nix-profile"), "bin")
+
+            output::info("To use installed packages, add to your ~/.zshrc or ~/.bashrc:")
+            write("")
+            write("  export PATH=\"" + profile_bin + ":$PATH\"")
+
+            let nix_sh: string = shellrc::find_nix_sh()
+            if nix_sh != "" is
+                write("  . '" + nix_sh + "'")
+            else is
+                write("  [ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \\")
+                write("      . ~/.nix-profile/etc/profile.d/nix.sh")
+            end
+
+            write("")
+            output::dim("Then reload: source ~/.zshrc  (or open a new terminal)")
+            output::dim("Tip: `hnm env activate --yes` patches these files for you automatically.")
+
+            let mut pi: int = 0
+            while pi < packages.len() is
+                let bare: string = strip_nixpkgs_prefix(packages[pi])
+                let in_hnm: bool = fs::exists(path::join(profile_bin, bare))
+                let in_default: bool = fs::exists(path::join(default_bin, bare))
+                if in_hnm is
+                    output::dim("  found: " + path::join(profile_bin, bare))
+                else is
+                    if in_default is
+                        output::dim("  found in default profile: " + path::join(default_bin, bare))
+                        output::dim("  also add: export PATH=\"" + default_bin + ":$PATH\"")
+                    end
+                end
+                pi = pi + 1
+            end
+        end
+
+        return true
+    end
+
+end
+
+;; ── from commands/list.h# ──────────────────────────────────────
+;; commands/list.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/list.rs
+
+
+
+mod cmd_list is
+
+    pub fn run(installed_only: bool, json: bool) -> bool is
+        if !nix::ensure_nix() is return false end
+        if installed_only is return run_installed(json) end
+        return run_all(json)
+    end
+
+    fn pkg_json(p: state::InstalledPkg) -> string is
+        return "{\"name\":\"" + p.name + "\",\"version\":\"" + p.version +
+               "\",\"attr_path\":\"" + p.attr_path + "\",\"pinned\":\"" + p.pinned +
+               "\",\"description\":\"" + p.description + "\"}"
+    end
+
+    ;; `hnm list -i` / `hnm list --installed` — packages HNM has
+    ;; installed and is tracking in state.json.
+    fn run_installed(json: bool) -> bool is
+        ;; best-effort reconciliation against the real nix-env profile
+        ;; before displaying anything
+        let profile_pkgs: [nix::Pkg] = nix::list_profile()
+        let sync: [int] = state::sync_from_profile(profile_pkgs)
+        let added: int = sync[0]
+        let removed: int = sync[1]
+        if !json && (added > 0 || removed > 0) is
+            output::dim("synced with nix-env profile (" + to_string(added) + " added, " + to_string(removed) + " removed)")
+        end
+
+        let pkgs: [state::InstalledPkg] = state::list()
+        let st: state::State = state::load()
+
+        if json is
+            let mut rows: [string] = []
+            let mut i: int = 0
+            while i < pkgs.len() is
+                rows.push(pkg_json(pkgs[i]))
+                i = i + 1
+            end
+            write("[\n  " + str::join(rows, ",\n  ") + "\n]")
+            return true
+        end
+
+        output::header("Installed packages")
+
+        if pkgs.len() == 0 is
+            output::dim("no packages installed via hnm yet.")
+            output::dim("Run `hnm search <query>` to find packages.")
+            return true
+        end
+
+        output::table_header()
+        let mut j: int = 0
+        while j < pkgs.len() is
+            let pkg: state::InstalledPkg = pkgs[j]
+            let mut pin: string = ""
+            if pkg.pinned != "" is pin = " [pinned: " + pkg.pinned + "]" end
+            output::table_row(pkg.name + pin, pkg.version, pkg.description, true)
+            j = j + 1
+        end
+
+        write("")
+        output::dim(to_string(pkgs.len()) + " package(s) installed")
+        if st.last_update > 0 is
+            output::dim("last updated: " + time::format(st.last_update, "%Y-%m-%d %H:%M UTC"))
+        end
+        return true
+    end
+
+    ;; Plain `hnm list` (no flag) — every package in the local nixpkgs
+    ;; index, with a checkmark next to anything HNM has installed.
+    fn run_all(json: bool) -> bool is
+        if !fs::exists(pkgdb::db_path()) is
+            output::warn("no package index yet \xe2\x80\x94 run `hnm update` first to build it")
+            return true
+        end
+
+        let mut limit: int = HNM_LIST_DEFAULT_ALL_LIMIT
+        if json is limit = -1 end
+        let entries: [pkgdb::Entry] = pkgdb::all(limit)
+        let total: int = pkgdb::entry_count()
+        let st: state::State = state::load()
+
+        if json is
+            let mut rows: [string] = []
+            let mut i: int = 0
+            while i < entries.len() is
+                let e: pkgdb::Entry = entries[i]
+                let mut is_installed: bool = false
+                let mut k: int = 0
+                while k < st.installed.len() is
+                    if st.installed[k].name == e.name is is_installed = true end
+                    k = k + 1
+                end
+                let mut inst_s: string = "false"
+                if is_installed is inst_s = "true" end
+                rows.push("{\"attr\":\"" + e.attr + "\",\"name\":\"" + e.name +
+                          "\",\"version\":\"" + e.version + "\",\"description\":\"" + e.description +
+                          "\",\"installed\":" + inst_s + "}")
+                i = i + 1
+            end
+            write("[\n  " + str::join(rows, ",\n  ") + "\n]")
+            return true
+        end
+
+        output::header("Available packages")
+        output::table_header()
+        let mut j: int = 0
+        while j < entries.len() is
+            let e: pkgdb::Entry = entries[j]
+            let mut is_installed: bool = false
+            let mut k2: int = 0
+            while k2 < st.installed.len() is
+                if st.installed[k2].name == e.name is is_installed = true end
+                k2 = k2 + 1
+            end
+            output::table_row(e.name, e.version, e.description, is_installed)
+            j = j + 1
+        end
+
+        write("")
+        if total > entries.len() is
+            output::dim("showing " + to_string(entries.len()) + " of " + to_string(total) +
+                        " package(s) \xe2\x80\x94 use `hnm search <query>` to filter, or `--json` for the full list")
+        else is
+            output::dim(to_string(total) + " package(s) in the index")
+        end
+        output::dim("Tip: `hnm list -i` shows only packages installed via hnm.")
+        return true
+    end
+
+end
+
+;; ── from commands/remove.h# ──────────────────────────────────────
+;; commands/remove.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/remove.rs
+
+
+mod cmd_remove is
+
+    pub fn run(packages: [string], force: bool) -> bool is
+        if packages.len() == 0 is
+            output::error("usage: hnm remove <package> [<package>...]")
+            return false
+        end
+        if !nix::ensure_nix() is return false end
+        output::header("Removing " + to_string(packages.len()) + " package(s)")
+
+        let st: state::State = state::load()
+        let mut to_remove: [string] = []
+        let mut skipped_pinned: [string] = []
+        let mut not_installed: [string] = []
+
+        let mut i: int = 0
+        while i < packages.len() is
+            let pkg_name: string = packages[i]
+            let mut idx: int = -1
+            let mut j: int = 0
+            while j < st.installed.len() is
+                if st.installed[j].name == pkg_name is idx = j end
+                j = j + 1
+            end
+            if idx < 0 is
+                not_installed.push(pkg_name)
+            else is
+                if st.installed[idx].pinned != "" && !force is
+                    skipped_pinned.push(pkg_name)
+                else is
+                    to_remove.push(pkg_name)
+                end
+            end
+            i = i + 1
+        end
+
+        let mut ni: int = 0
+        while ni < not_installed.len() is
+            output::warn("'" + not_installed[ni] + "' is not installed \xe2\x80\x94 skipping")
+            ni = ni + 1
+        end
+        let mut pi: int = 0
+        while pi < skipped_pinned.len() is
+            output::warn("'" + skipped_pinned[pi] + "' is pinned \xe2\x80\x94 use --force to remove it anyway")
+            pi = pi + 1
+        end
+
+        if to_remove.len() == 0 is
+            output::info("nothing to remove")
+            return true
+        end
+
+        if !force is
+            write("")
+            output::info("about to remove: " + str::join(to_remove, ", "))
+            if !output::confirm("Proceed?") is
+                output::warn("aborted \xe2\x80\x94 nothing was removed")
+                return true
+            end
+        end
+
+        let mut failed: [string] = []
+
+        let mut ri: int = 0
+        while ri < to_remove.len() is
+            let pkg_name: string = to_remove[ri]
+            write("")
+            output::step(to_string(ri + 1) + "/" + to_string(to_remove.len()), "removing  " + pkg_name)
+
+            let task: progress::TaskProgress = progress::task(100, "removing " + pkg_name)
+            let ok: bool = nix::remove(pkg_name, task)
+            progress::inc(task, 90)
+
+            if ok is
+                state::remove(pkg_name)
+                progress::inc(task, 10)
+                progress::finish_ok(task, "removed " + pkg_name)
+            else is
+                progress::finish_err(task, "remove failed")
+                failed.push(pkg_name)
+            end
+            ri = ri + 1
+        end
+
+        write("")
+        if failed.len() > 0 is
+            output::error("failed to remove: " + str::join(failed, ", "))
+            return false
+        end
+
+        output::ok("done")
+
+        let gen: int = nix::current_generation()
+        if gen >= 0 is state::set_generation(gen) end
+
+        let cfg: config::HnmConfig = config::load()
+        if cfg.max_generations > 0 is
+            let task2: progress::TaskProgress = progress::task(1, "pruning old generations")
+            let n: int = nix::prune_old_generations(cfg.max_generations, task2)
+            if n > 0 is
+                output::dim("pruned " + to_string(n) + " old generation(s) (max_generations = " + to_string(cfg.max_generations) + ")")
+            end
+        end
+        if cfg.auto_gc is
+            output::info("auto_gc is enabled in config.hk \xe2\x80\x94 running `hnm gc`...")
+            let task3: progress::TaskProgress = progress::task(100, "nix-store --gc")
+            nix::gc(task3)
+        end
+
+        return true
+    end
+
+end
+
+;; ── from commands/rollback.h# ──────────────────────────────────────
+;; commands/rollback.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/rollback.rs
+;;
+;; `generation < 0` means "no generation given" (was Option<u32>).
+
+
+mod cmd_rollback is
+
+    pub fn run(generation: int) -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Rollback")
+
+        let gens: [[string]] = nix::list_generations()
+        if gens.len() == 0 is
+            output::error("no generations found in profile")
+            return false
+        end
+
+        output::dim("Available generations:")
+        let mut i: int = 0
+        while i < gens.len() is
+            let mut marker: string = ""
+            if gens[i][2] == "true" is marker = "  \xe2\x86\x90 current" end
+            output::dim("  gen " + fmt::pad_left(gens[i][0], 4) + "   " + gens[i][1] + marker)
+            i = i + 1
+        end
+        write("")
+
+        let mut target: int = generation
+        if target < 0 is
+            let mut current_idx: int = -1
+            let mut j: int = 0
+            while j < gens.len() is
+                if gens[j][2] == "true" is current_idx = j end
+                j = j + 1
+            end
+            if current_idx > 0 is
+                target = conv::str_to_int(gens[current_idx - 1][0])
+            else is
+                output::error("cannot determine previous generation")
+                return false
+            end
+        end
+
+        let mut exists: bool = false
+        let mut k: int = 0
+        while k < gens.len() is
+            if conv::str_to_int(gens[k][0]) == target is exists = true end
+            k = k + 1
+        end
+        if !exists is
+            output::error("generation " + to_string(target) + " does not exist")
+            return false
+        end
+
+        let task: progress::TaskProgress = progress::task(100, "switching to generation " + to_string(target))
+        progress::log(task, "nix-env --switch-generation " + to_string(target))
+        let ok: bool = nix::switch_generation(target, task)
+        if !ok is return false end
+        progress::finish_ok(task, "rolled back to generation " + to_string(target))
+
+        state::set_generation(target)
+        let profile_pkgs: [nix::Pkg] = nix::list_profile()
+        let sync: [int] = state::sync_from_profile(profile_pkgs)
+        if sync[0] > 0 || sync[1] > 0 is
+            output::dim("resynced tracked packages (" + to_string(sync[0]) + " added, " + to_string(sync[1]) + " removed)")
+        end
+
+        write("")
+        output::ok("now at generation " + to_string(target))
+        output::dim("Run `hnm list -i` to see current packages.")
+        return true
+    end
+
+end
+
+;; ── from commands/update.h# ──────────────────────────────────────
+;; commands/update.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/update.rs
+
+
+mod cmd_update is
+
+    pub fn run(packages: [string]) -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Update HNM")
+
+        ;; ── Step 1: refresh nixpkgs channel ─────────────────────────
+        let task1: progress::TaskProgress = progress::task(100, "refreshing nixpkgs channel")
+        if !nix::update_channel(task1) is return false end
+        progress::finish_ok(task1, "channel refreshed")
+        write("")
+
+        ;; ── Step 2: rebuild local package index ─────────────────────
+        let task2: progress::TaskProgress = progress::task(100, "building local package index...")
+        progress::log(task2, "streaming nix-env -qaP \xe2\x86\x92 ~/.local/share/hnm/pkgdb.tsv")
+        progress::log(task2, "this takes 1-2 minutes on first run, ~30s on subsequent runs")
+
+        let count: int = pkgdb::rebuild_db(
+            |msg: string| is progress::log(task2, msg) end,
+            |msg: string| is progress::err_line(task2, msg) end,
+        )
+
+        if count >= 0 is
+            progress::inc(task2, 100)
+            progress::finish_ok(task2, "indexed " + to_string(count) + " packages")
+        else is
+            progress::finish_err(task2, "package index build failed")
+            output::warn("package index build failed \xe2\x80\x94 search may not work")
+            output::dim("Try: hnm unpack  (to ensure nixpkgs channel is registered)")
+        end
+        write("")
+
+        ;; ── Step 3: upgrade installed packages (one at a time) ──────
+        let tracked: [state::InstalledPkg] = state::list()
+
+        if tracked.len() == 0 is
+            output::dim("no packages installed \xe2\x80\x94 nothing to upgrade")
+        else is
+            let explicit: bool = packages.len() > 0
+            let mut to_upgrade: [state::InstalledPkg] = []
+            let mut i: int = 0
+            while i < tracked.len() is
+                let mut wanted: bool = !explicit
+                if explicit is
+                    let mut j: int = 0
+                    while j < packages.len() is
+                        if packages[j] == tracked[i].name is wanted = true end
+                        j = j + 1
+                    end
+                end
+                if wanted is to_upgrade.push(tracked[i]) end
+                i = i + 1
+            end
+
+            let mut pinned: [state::InstalledPkg] = []
+            let mut unpinned: [state::InstalledPkg] = []
+            let mut k: int = 0
+            while k < to_upgrade.len() is
+                if to_upgrade[k].pinned != "" is pinned.push(to_upgrade[k]) else is unpinned.push(to_upgrade[k]) end
+                k = k + 1
+            end
+            to_upgrade = unpinned
+
+            let mut pi: int = 0
+            while pi < pinned.len() is
+                let mut pv: string = "?"
+                if pinned[pi].pinned != "" is pv = pinned[pi].pinned end
+                output::warn("skipping '" + pinned[pi].name + "' \xe2\x80\x94 pinned to " + pv)
+                pi = pi + 1
+            end
+
+            if to_upgrade.len() > 0 is
+                output::info("upgrading " + to_string(to_upgrade.len()) + " package(s) one at a time...")
+                write("")
+
+                let total: int = to_upgrade.len()
+                let mut upgraded: int = 0
+                let mut failed_pkgs: [string] = []
+
+                let mut ui: int = 0
+                while ui < total is
+                    let pkg: state::InstalledPkg = to_upgrade[ui]
+                    output::step(to_string(ui + 1) + "/" + to_string(total), "upgrading  " + pkg.name)
+                    let task3: progress::TaskProgress = progress::task(100, "nix-env -uA nixpkgs." + pkg.name)
+                    let ok: bool = nix::upgrade_one(pkg.name, task3)
+                    progress::inc(task3, 90)
+                    if ok is
+                        progress::inc(task3, 10)
+                        progress::finish_ok(task3, pkg.name + " upgraded")
+                        upgraded = upgraded + 1
+                    else is
+                        progress::finish_err(task3, "upgrade failed")
+                        failed_pkgs.push(pkg.name)
+                    end
+                    write("")
+                    ui = ui + 1
+                end
+
+                output::header("Update summary")
+                output::label("upgraded", to_string(upgraded))
+                output::label("failed", to_string(failed_pkgs.len()))
+                if pinned.len() > 0 is
+                    output::label("skipped (pinned)", to_string(pinned.len()))
+                end
+                if failed_pkgs.len() > 0 is
+                    write("")
+                    output::warn("failed: " + str::join(failed_pkgs, ", "))
+                end
+            end
+        end
+
+        let mut st: state::State = state::load()
+        st.last_update = time::now_unix()
+        state::save(st)
+
+        let gen: int = nix::current_generation()
+        if gen >= 0 is state::set_generation(gen) end
+
+        let cfg: config::HnmConfig = config::load()
+        if cfg.max_generations > 0 is
+            let task4: progress::TaskProgress = progress::task(1, "pruning old generations")
+            let n: int = nix::prune_old_generations(cfg.max_generations, task4)
+            if n > 0 is
+                output::dim("pruned " + to_string(n) + " old generation(s) (max_generations = " + to_string(cfg.max_generations) + ")")
+            end
+        end
+        if cfg.auto_gc is
+            output::info("auto_gc is enabled in config.hk \xe2\x80\x94 running `hnm gc`...")
+            let task5: progress::TaskProgress = progress::task(100, "nix-store --gc")
+            nix::gc(task5)
+        end
+
+        write("")
+        output::ok("HNM is up to date")
+        return true
+    end
+
+end
+
+;; ── from commands/upgrade.h# ──────────────────────────────────────
+;; commands/upgrade.h# — HackerOS Nix Manager (H# port)
+;; 1:1 port of source-code/src/commands/upgrade.rs — self-update from
+;; GitHub releases.
+;;
+;; ADAPTATION NOTE: no `sudo`-status-aware exec here beyond shelling
+;; out exactly like the original did — `sudo rm`/`sudo mv` still run
+;; via `proc_run_cmd`, so an interactive sudo password prompt (if the
+;; user's sudo isn't passwordless / recently authenticated) will not
+;; have a terminal to prompt on, the same practical caveat the
+;; original's `Stdio`-inherited `Command::status()` calls didn't fully
+;; solve either — both rely on the environment's sudo cache.
+
+
+    "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Nix-Manager/main/version.hacker"
+    "https://github.com/HackerOS-Linux-System/HackerOS-Nix-Manager/releases/download"
+
+mod cmd_upgrade is
+
+    fn local_version_file() -> string is
+        return path::join(path::join(path::join(config::home(), ".hackeros"), "hnm"), "version.hacker")
+    end
+
+    fn tmp_version_file() -> string is
+        return path::join(os::temp_dir(), ".hnm_upstream_version.hacker")
+    end
+
+    ;; version.hacker format:
+    ;; [
+    ;;   0.1
+    ;; ]
+    fn parse_version(content: string) -> string is
+        let lines: [string] = str::split(content, "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let mut t: string = str::trim(lines[i])
+            t = str::replace_all(t, "[", "")
+            t = str::replace_all(t, "]", "")
+            t = str::trim(t)
+            if t != "" is
+                let mut all_ok: bool = true
+                let mut j: int = 0
+                while j < t.len() is
+                    let c: string = t[j..j + 1]
+                    if !str::is_numeric(c) && c != "." is all_ok = false end
+                    j = j + 1
+                end
+                if all_ok is return t end
+            end
+            i = i + 1
+        end
+        return ""
+    end
+
+    fn version_part(s: string, idx: int) -> int is
+        let parts: [string] = str::split(s, ".")
+        if idx >= parts.len() is return 0 end
+        if !str::is_numeric(parts[idx]) is return 0 end
+        return conv::str_to_int(parts[idx])
+    end
+
+    fn version_greater(upstream: string, local: string) -> bool is
+        let up: [string] = str::split(upstream, ".")
+        let lo: [string] = str::split(local, ".")
+        let mut max_len: int = up.len()
+        if lo.len() > max_len is max_len = lo.len() end
+
+        let mut i: int = 0
+        while i < max_len is
+            let ui: int = version_part(upstream, i)
+            let li: int = version_part(local, i)
+            if ui > li is return true end
+            if ui < li is return false end
+            i = i + 1
+        end
+        return false
+    end
+
+    fn curl_download(url: string, dest: string, task: progress::TaskProgress) -> bool is
+        progress::log(task, "curl -fsSL " + url + " -o " + dest)
+        let cmd: string = util::build_shell_cmd("curl", ["-fsSL", url, "-o", dest], [])
+        let r = proc_run_cmd(cmd, 120)
+        if r.exit_code != 0 is return false end
+        return true
+    end
+
+    pub fn run() -> bool is
+        output::header("HNM Self-Upgrade")
+
+        ;; ── 1. Read local version ────────────────────────────────────
+        let local_ver_path: string = local_version_file()
+        let mut local_version: string = ""
+        if fs::exists(local_ver_path) is
+            let content: string = fs::read(local_ver_path)
+            local_version = parse_version(content)
+            if local_version == "" is
+                output::error("cannot parse local version file at " + local_ver_path)
+                return false
+            end
+        else is
+            local_version = HNM_VERSION
+            output::warn("local version file not found at " + local_ver_path + " \xe2\x80\x94 creating with version " + local_version)
+            fs::mkdir(path::parent(local_ver_path))
+            fs::write(local_ver_path, "[\n  " + local_version + "\n]\n")
+        end
+
+        output::label("current version", local_version)
+
+        ;; ── 2. Download upstream version.hacker ─────────────────────
+        let task: progress::TaskProgress = progress::task(100, "checking for updates...")
+        progress::log(task, "fetching " + HNM_UPSTREAM_VERSION_URL)
+
+        let tmp: string = tmp_version_file()
+        let dl_ok: bool = curl_download(HNM_UPSTREAM_VERSION_URL, tmp, task)
+        progress::inc(task, 50)
+
+        if !dl_ok is
+            progress::finish_err(task, "download failed")
+            output::warn("Could not reach GitHub \xe2\x80\x94 check your internet connection.")
+            output::error("cannot check for updates")
+            return false
+        end
+        progress::finish_ok(task, "version info fetched")
+
+        ;; ── 3. Parse upstream version ────────────────────────────────
+        let upstream_content: string = fs::read(tmp)
+        fs::remove(tmp)
+
+        let upstream_version: string = parse_version(upstream_content)
+        if upstream_version == "" is
+            output::error("cannot parse upstream version.hacker")
+            return false
+        end
+
+        output::label("latest version", upstream_version)
+
+        ;; ── 4. Compare ───────────────────────────────────────────────
+        if !version_greater(upstream_version, local_version) is
+            write("")
+            output::ok("HNM is up to date  (v" + local_version + ")")
+            return true
+        end
+
+        write("")
+        output::info("New version available: " + local_version + " \xe2\x86\x92 " + upstream_version)
+        write("")
+
+        ;; ── 5. Download new binary ───────────────────────────────────
+        let download_url: string = HNM_UPSTREAM_RELEASE_URL + "/v" + upstream_version + "/hnm"
+        let tmp_bin: string = path::join(os::temp_dir(), ".hnm_upgrade_bin")
+
+        let task2: progress::TaskProgress = progress::task(100, "downloading hnm v" + upstream_version)
+        progress::log(task2, "curl -fsSL " + download_url + " -o " + tmp_bin)
+        let dl2_ok: bool = curl_download(download_url, tmp_bin, task2)
+        progress::inc(task2, 70)
+
+        if !dl2_ok is
+            progress::finish_err(task2, "download failed")
+            output::error("failed to download new binary")
+            return false
+        end
+        progress::inc(task2, 30)
+        progress::finish_ok(task2, "binary downloaded")
+
+        ;; ── 6. chmod +x ──────────────────────────────────────────────
+        let chmod_r = proc_run_cmd("chmod a+x " + util::shell_quote(tmp_bin), 10)
+        if chmod_r.exit_code != 0 is
+            output::error("chmod a+x failed on downloaded binary")
+            return false
+        end
+
+        ;; ── 7. sudo mv to /usr/bin/hnm ─────────────────────────────
+        output::info("Installing to /usr/bin/hnm  (requires sudo)...")
+
+        let task3: progress::TaskProgress = progress::task(100, "installing to /usr/bin/hnm")
+        progress::log(task3, "sudo rm -rf /usr/bin/hnm")
+        let rm_r = proc_run_cmd("sudo rm -rf /usr/bin/hnm", 30)
+        if rm_r.exit_code != 0 is
+            progress::finish_err(task3, "sudo rm /usr/bin/hnm failed")
+            output::error("failed to remove old /usr/bin/hnm \xe2\x80\x94 do you have sudo?")
+            return false
+        end
+        progress::inc(task3, 30)
+
+        progress::log(task3, "sudo mv " + tmp_bin + " /usr/bin/hnm")
+        let mv_r = proc_run_cmd("sudo mv " + util::shell_quote(tmp_bin) + " /usr/bin/hnm", 30)
+        if mv_r.exit_code != 0 is
+            progress::finish_err(task3, "sudo mv failed")
+            output::error("failed to move binary to /usr/bin/hnm")
+            return false
+        end
+        progress::inc(task3, 70)
+        progress::finish_ok(task3, "hnm v" + upstream_version + " installed to /usr/bin/hnm")
+
+        ;; ── 8. Update local version file ────────────────────────────
+        fs::write(local_ver_path, "[\n  " + upstream_version + "\n]\n")
+
+        write("")
+        output::ok("HNM upgraded  v" + local_version + "  \xe2\x86\x92  v" + upstream_version)
+        output::dim("Run `hnm version` to confirm.")
+
+        return true
+    end
+
+end
+
+;; ─── entry point ─────────────────────────────────────────────────────
+;; 1:1 port of source-code/src/main.rs's dispatch table.
+
+fn main() is
+    let cmd: cliapp::CliCommand = cliapp::parse()
+    let mut ok: bool = true
+
+    if cmd.kind == "__exit_ok" is return end
+    if cmd.kind == "error"     is output::error(cmd.error_msg) ; ok = false end
+    if cmd.kind == "help"      is cliapp::print_help() end
+    if cmd.kind == "version"   is output::version_info() end
+    if cmd.kind == "search"    is ok = cmd_search::run(cmd.query, cmd.json) end
+    if cmd.kind == "install"   is ok = cmd_install::run(cmd.packages, cmd.no_env) end
+    if cmd.kind == "remove"    is ok = cmd_remove::run(cmd.packages, cmd.force) end
+    if cmd.kind == "update"    is ok = cmd_update::run(cmd.packages) end
+    if cmd.kind == "upgrade"   is ok = cmd_upgrade::run() end
+    if cmd.kind == "unpack"    is ok = cmd_unpack::run() end
+    if cmd.kind == "check"     is ok = cmd_check::run() end
+    if cmd.kind == "info"      is ok = cmd_info::run(cmd.package) end
+    if cmd.kind == "list"      is ok = cmd_list::run(cmd.installed, cmd.json) end
+    if cmd.kind == "env"       is ok = cmd_env::run(cmd.sub, cmd.yes) end
+    if cmd.kind == "doctor"    is ok = cmd_doctor::run() end
+    if cmd.kind == "clean"     is ok = cmd_clean::run() end
+    if cmd.kind == "rollback"  is ok = cmd_rollback::run(cmd.generation) end
+    if cmd.kind == "pin"       is ok = cmd_pin::run(cmd.package, cmd.version_arg) end
+    if cmd.kind == "unpin"     is ok = cmd_unpin::run(cmd.package) end
+    if cmd.kind == "which"     is ok = cmd_which::run(cmd.package) end
+    if cmd.kind == "gc"        is ok = cmd_gc::run() end
+
+    if !ok is
+        exit(1)
+    end
+end
