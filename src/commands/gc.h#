@@ -1,0 +1,24 @@
+mod cmd_gc is
+
+    pub fn run() -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Nix garbage collection")
+
+        let before: string = nix::store_du()
+        output::label("store size before", before)
+        write("")
+
+        let task: progress::TaskProgress = progress::task(100, "running nix-store --gc")
+        progress::log(task, "nix-store --gc")
+        let ok: bool = nix::gc(task)
+        if !ok is return false end
+        progress::finish_ok(task, "garbage collection complete")
+
+        write("")
+        let after: string = nix::store_du()
+        output::label("store size after", after)
+        output::ok("done")
+        return true
+    end
+
+end
