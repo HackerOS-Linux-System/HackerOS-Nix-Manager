@@ -1,0 +1,136 @@
+use "std -> fs"      from "fs"
+use "std -> time"    from "time"
+use "std -> strings" from "str"
+
+pub const HNM_LIST_DEFAULT_ALL_LIMIT: int = 200
+
+mod cmd_list is
+
+    pub fn run(installed_only: bool, json: bool) -> bool is
+        if !nix::ensure_nix() is return false end
+        if installed_only is return run_installed(json) end
+        return run_all(json)
+    end
+
+    fn pkg_json(p: state::InstalledPkg) -> string is
+        return "{\"name\":\"" + p.name + "\",\"version\":\"" + p.version +
+               "\",\"attr_path\":\"" + p.attr_path + "\",\"pinned\":\"" + p.pinned +
+               "\",\"description\":\"" + p.description + "\"}"
+    end
+
+    ;; `hnm list -i` / `hnm list --installed` — packages HNM has
+    ;; installed and is tracking in state.json.
+    fn run_installed(json: bool) -> bool is
+        ;; best-effort reconciliation against the real nix-env profile
+        ;; before displaying anything
+        let profile_pkgs: [nix::Pkg] = nix::list_profile()
+        let sync: [int] = state::sync_from_profile(profile_pkgs)
+        let added: int = sync[0]
+        let removed: int = sync[1]
+        if !json && (added > 0 || removed > 0) is
+            output::dim("synced with nix-env profile (" + to_string(added) + " added, " + to_string(removed) + " removed)")
+        end
+
+        let pkgs: [state::InstalledPkg] = state::list()
+        let st: state::State = state::load()
+
+        if json is
+            let mut rows: [string] = []
+            let mut i: int = 0
+            while i < pkgs.len() is
+                rows.push(pkg_json(pkgs[i]))
+                i = i + 1
+            end
+            write("[\n  " + str::join(rows, ",\n  ") + "\n]")
+            return true
+        end
+
+        output::header("Installed packages")
+
+        if pkgs.len() == 0 is
+            output::dim("no packages installed via hnm yet.")
+            output::dim("Run `hnm search <query>` to find packages.")
+            return true
+        end
+
+        output::table_header()
+        let mut j: int = 0
+        while j < pkgs.len() is
+            let pkg: state::InstalledPkg = pkgs[j]
+            let mut pin: string = ""
+            if pkg.pinned != "" is pin = " [pinned: " + pkg.pinned + "]" end
+            output::table_row(pkg.name + pin, pkg.version, pkg.description, true)
+            j = j + 1
+        end
+
+        write("")
+        output::dim(to_string(pkgs.len()) + " package(s) installed")
+        if st.last_update > 0 is
+            output::dim("last updated: " + time::format(st.last_update, "%Y-%m-%d %H:%M UTC"))
+        end
+        return true
+    end
+
+    ;; Plain `hnm list` (no flag) — every package in the local nixpkgs
+    ;; index, with a checkmark next to anything HNM has installed.
+    fn run_all(json: bool) -> bool is
+        if !fs::exists(pkgdb::db_path()) is
+            output::warn("no package index yet \xe2\x80\x94 run `hnm update` first to build it")
+            return true
+        end
+
+        let mut limit: int = HNM_LIST_DEFAULT_ALL_LIMIT
+        if json is limit = -1 end
+        let entries: [pkgdb::Entry] = pkgdb::all(limit)
+        let total: int = pkgdb::entry_count()
+        let st: state::State = state::load()
+
+        if json is
+            let mut rows: [string] = []
+            let mut i: int = 0
+            while i < entries.len() is
+                let e: pkgdb::Entry = entries[i]
+                let mut is_installed: bool = false
+                let mut k: int = 0
+                while k < st.installed.len() is
+                    if st.installed[k].name == e.name is is_installed = true end
+                    k = k + 1
+                end
+                let mut inst_s: string = "false"
+                if is_installed is inst_s = "true" end
+                rows.push("{\"attr\":\"" + e.attr + "\",\"name\":\"" + e.name +
+                          "\",\"version\":\"" + e.version + "\",\"description\":\"" + e.description +
+                          "\",\"installed\":" + inst_s + "}")
+                i = i + 1
+            end
+            write("[\n  " + str::join(rows, ",\n  ") + "\n]")
+            return true
+        end
+
+        output::header("Available packages")
+        output::table_header()
+        let mut j: int = 0
+        while j < entries.len() is
+            let e: pkgdb::Entry = entries[j]
+            let mut is_installed: bool = false
+            let mut k2: int = 0
+            while k2 < st.installed.len() is
+                if st.installed[k2].name == e.name is is_installed = true end
+                k2 = k2 + 1
+            end
+            output::table_row(e.name, e.version, e.description, is_installed)
+            j = j + 1
+        end
+
+        write("")
+        if total > entries.len() is
+            output::dim("showing " + to_string(entries.len()) + " of " + to_string(total) +
+                        " package(s) \xe2\x80\x94 use `hnm search <query>` to filter, or `--json` for the full list")
+        else is
+            output::dim(to_string(total) + " package(s) in the index")
+        end
+        output::dim("Tip: `hnm list -i` shows only packages installed via hnm.")
+        return true
+    end
+
+end
