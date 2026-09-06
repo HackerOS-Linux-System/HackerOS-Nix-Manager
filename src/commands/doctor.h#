@@ -1,0 +1,120 @@
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> env"     from "env"
+use "std -> strings" from "str"
+use "std -> fmt"     from "fmt"
+
+mod cmd_doctor is
+
+    fn check_bin(bin: string, args_str: string, counter: int) -> int is
+        let r = proc_run_cmd(bin + " " + args_str, 10)
+        if r.exit_code == 0 is
+            output::ok(fmt::pad_right(bin, 14) + " " + str::trim(r.stdout))
+            return counter
+        end
+        output::warn(fmt::pad_right(bin, 14) + " NOT FOUND")
+        return counter + 1
+    end
+
+    pub fn run() -> bool is
+        output::header("HNM Doctor \xe2\x80\x94 system diagnostics")
+
+        let mut warnings: int = 0
+        let mut errors: int = 0
+
+        errors = check_bin("nix", "--version", errors)
+        errors = check_bin("nix-env", "--version", errors)
+        errors = check_bin("nix-channel", "--version", errors)
+        warnings = check_bin("nix-store", "--version", warnings)
+
+        write("")
+        let chan_r = proc_run_cmd("nix-channel --list", 10)
+        if chan_r.exit_code == 0 is
+            let raw: string = str::trim(chan_r.stdout)
+            if raw == "" is
+                output::warn("no Nix channels registered  \xe2\x86\x92  run `hnm unpack`")
+                warnings = warnings + 1
+            else is
+                output::ok("channels   " + str::replace_all(raw, "\n", "  |  "))
+            end
+        else is
+            output::warn("could not list channels")
+            warnings = warnings + 1
+        end
+
+        let profile: string = config::profile_dir()
+        if fs::exists(profile) is
+            output::ok("profile    " + profile)
+        else is
+            output::warn("profile dir not found: " + profile + "  (ok if no packages installed yet)")
+        end
+
+        if fs::exists("/nix/store") is
+            output::ok("/nix/store  exists   (" + nix::store_du() + ")")
+        else is
+            output::warn("/nix/store does not exist \xe2\x80\x94 Nix may not be installed")
+            warnings = warnings + 1
+        end
+
+        write("")
+        let st: state::State = state::load()
+        output::ok("state      " + to_string(st.installed.len()) + " package(s) tracked")
+
+        ;; read-only drift check between state.json and the real
+        ;; nix-env profile
+        let profile_pkgs: [nix::Pkg] = nix::list_profile()
+        let mut missing_from_state: int = 0
+        let mut i: int = 0
+        while i < profile_pkgs.len() is
+            let mut found: bool = false
+            let mut j: int = 0
+            while j < st.installed.len() is
+                if st.installed[j].name == profile_pkgs[i].name is found = true end
+                j = j + 1
+            end
+            if !found is missing_from_state = missing_from_state + 1 end
+            i = i + 1
+        end
+        let mut stale_in_state: int = 0
+        let mut k: int = 0
+        while k < st.installed.len() is
+            let mut found2: bool = false
+            let mut m: int = 0
+            while m < profile_pkgs.len() is
+                if profile_pkgs[m].name == st.installed[k].name is found2 = true end
+                m = m + 1
+            end
+            if !found2 is stale_in_state = stale_in_state + 1 end
+            k = k + 1
+        end
+        if missing_from_state > 0 || stale_in_state > 0 is
+            output::warn("state drift: " + to_string(missing_from_state) + " untracked in profile, " +
+                         to_string(stale_in_state) + " stale in state.json  \xe2\x86\x92  run `hnm list -i`")
+            warnings = warnings + 1
+        end
+
+        let cfg: config::HnmConfig = config::load()
+        output::ok("config     channel = " + cfg.nix_channel)
+
+        write("")
+        let path_var: string = env::get("PATH")
+        if str::index_of(path_var, ".nix-profile") >= 0 is
+            output::ok("PATH       contains .nix-profile")
+        else is
+            output::warn("PATH does not include ~/.nix-profile/bin")
+            output::dim("Add to your shell rc:  . ~/.nix-profile/etc/profile.d/nix.sh")
+            warnings = warnings + 1
+        end
+
+        write("")
+        if errors == 0 && warnings == 0 is
+            output::ok("all checks passed \xe2\x80\x94 HNM is healthy")
+        else is
+            if errors > 0 is output::warn(to_string(errors) + " error(s) found") end
+            if warnings > 0 is output::dim(to_string(warnings) + " warning(s) \xe2\x80\x94 see above") end
+        end
+
+        return true
+    end
+
+end
