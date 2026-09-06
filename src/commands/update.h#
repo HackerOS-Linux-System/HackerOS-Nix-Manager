@@ -1,0 +1,140 @@
+use "std -> time" from "time"
+
+mod cmd_update is
+
+    pub fn run(packages: [string]) -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Update HNM")
+
+        ;; ── Step 1: refresh nixpkgs channel ─────────────────────────
+        let task1: progress::TaskProgress = progress::task(100, "refreshing nixpkgs channel")
+        if !nix::update_channel(task1) is return false end
+        progress::finish_ok(task1, "channel refreshed")
+        write("")
+
+        ;; ── Step 2: rebuild local package index ─────────────────────
+        let task2: progress::TaskProgress = progress::task(100, "building local package index...")
+        progress::log(task2, "streaming nix-env -qaP \xe2\x86\x92 ~/.local/share/hnm/pkgdb.tsv")
+        progress::log(task2, "this takes 1-2 minutes on first run, ~30s on subsequent runs")
+
+        let count: int = pkgdb::rebuild_db(
+            |msg: string| is progress::log(task2, msg) end,
+            |msg: string| is progress::err_line(task2, msg) end,
+        )
+
+        if count >= 0 is
+            progress::inc(task2, 100)
+            progress::finish_ok(task2, "indexed " + to_string(count) + " packages")
+        else is
+            progress::finish_err(task2, "package index build failed")
+            output::warn("package index build failed \xe2\x80\x94 search may not work")
+            output::dim("Try: hnm unpack  (to ensure nixpkgs channel is registered)")
+        end
+        write("")
+
+        ;; ── Step 3: upgrade installed packages (one at a time) ──────
+        let tracked: [state::InstalledPkg] = state::list()
+
+        if tracked.len() == 0 is
+            output::dim("no packages installed \xe2\x80\x94 nothing to upgrade")
+        else is
+            let explicit: bool = packages.len() > 0
+            let mut to_upgrade: [state::InstalledPkg] = []
+            let mut i: int = 0
+            while i < tracked.len() is
+                let mut wanted: bool = !explicit
+                if explicit is
+                    let mut j: int = 0
+                    while j < packages.len() is
+                        if packages[j] == tracked[i].name is wanted = true end
+                        j = j + 1
+                    end
+                end
+                if wanted is to_upgrade.push(tracked[i]) end
+                i = i + 1
+            end
+
+            let mut pinned: [state::InstalledPkg] = []
+            let mut unpinned: [state::InstalledPkg] = []
+            let mut k: int = 0
+            while k < to_upgrade.len() is
+                if to_upgrade[k].pinned != "" is pinned.push(to_upgrade[k]) else is unpinned.push(to_upgrade[k]) end
+                k = k + 1
+            end
+            to_upgrade = unpinned
+
+            let mut pi: int = 0
+            while pi < pinned.len() is
+                let mut pv: string = "?"
+                if pinned[pi].pinned != "" is pv = pinned[pi].pinned end
+                output::warn("skipping '" + pinned[pi].name + "' \xe2\x80\x94 pinned to " + pv)
+                pi = pi + 1
+            end
+
+            if to_upgrade.len() > 0 is
+                output::info("upgrading " + to_string(to_upgrade.len()) + " package(s) one at a time...")
+                write("")
+
+                let total: int = to_upgrade.len()
+                let mut upgraded: int = 0
+                let mut failed_pkgs: [string] = []
+
+                let mut ui: int = 0
+                while ui < total is
+                    let pkg: state::InstalledPkg = to_upgrade[ui]
+                    output::step(to_string(ui + 1) + "/" + to_string(total), "upgrading  " + pkg.name)
+                    let task3: progress::TaskProgress = progress::task(100, "nix-env -uA nixpkgs." + pkg.name)
+                    let ok: bool = nix::upgrade_one(pkg.name, task3)
+                    progress::inc(task3, 90)
+                    if ok is
+                        progress::inc(task3, 10)
+                        progress::finish_ok(task3, pkg.name + " upgraded")
+                        upgraded = upgraded + 1
+                    else is
+                        progress::finish_err(task3, "upgrade failed")
+                        failed_pkgs.push(pkg.name)
+                    end
+                    write("")
+                    ui = ui + 1
+                end
+
+                output::header("Update summary")
+                output::label("upgraded", to_string(upgraded))
+                output::label("failed", to_string(failed_pkgs.len()))
+                if pinned.len() > 0 is
+                    output::label("skipped (pinned)", to_string(pinned.len()))
+                end
+                if failed_pkgs.len() > 0 is
+                    write("")
+                    output::warn("failed: " + str::join(failed_pkgs, ", "))
+                end
+            end
+        end
+
+        let mut st: state::State = state::load()
+        st.last_update = time::now_unix()
+        state::save(st)
+
+        let gen: int = nix::current_generation()
+        if gen >= 0 is state::set_generation(gen) end
+
+        let cfg: config::HnmConfig = config::load()
+        if cfg.max_generations > 0 is
+            let task4: progress::TaskProgress = progress::task(1, "pruning old generations")
+            let n: int = nix::prune_old_generations(cfg.max_generations, task4)
+            if n > 0 is
+                output::dim("pruned " + to_string(n) + " old generation(s) (max_generations = " + to_string(cfg.max_generations) + ")")
+            end
+        end
+        if cfg.auto_gc is
+            output::info("auto_gc is enabled in config.hk \xe2\x80\x94 running `hnm gc`...")
+            let task5: progress::TaskProgress = progress::task(100, "nix-store --gc")
+            nix::gc(task5)
+        end
+
+        write("")
+        output::ok("HNM is up to date")
+        return true
+    end
+
+end
