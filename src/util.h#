@@ -1,0 +1,69 @@
+use "std -> strings" from "str"
+
+mod util is
+
+    ;; Split a "name-version" string (as produced by `nix-env -qaP`, e.g.
+    ;; "ripgrep-14.1.1") into ("ripgrep", "14.1.1"). Mirrors the original
+    ;; Rust `split_name_version`: walks backwards looking for the LAST
+    ;; "-<digit>" boundary, so a name containing embedded digits/dashes
+    ;; (e.g. "python3.11-requests-2.31.0") still splits correctly.
+    ;;
+    ;; Returns a 2-element array: [name, version]. (H# has no tuple
+    ;; return type in this grammar, so an array stands in for Rust's
+    ;; `(String, String)` — every call site destructures index 0 / 1.)
+    pub fn split_name_version(s: string) -> [string] is
+        let n: int = s.len()
+        let mut split_at: int = -1
+        let mut i: int = n - 1
+        while i >= 1 is
+            let prev: string = s[i - 1..i]
+            let cur:  string = s[i..i + 1]
+            if prev == "-" && str::is_numeric(cur) is
+                split_at = i - 1
+                break
+            end
+            i = i - 1
+        end
+
+        if split_at >= 0 is
+            return [s[0..split_at], s[split_at + 1..n]]
+        end
+        return [s, ""]
+    end
+
+    ;; ── [EXTENDED] shell command assembly ────────────────────────────
+    ;; H#'s process primitive (the compiler-injected `proc_run_cmd`, see
+    ;; PORTING-NOTES.md) runs one shell string through `/bin/sh -c`,
+    ;; unlike Rust's `std::process::Command` builder (program + argv
+    ;; array + env map, no shell involved). These two helpers rebuild
+    ;; that same "program, explicit args, explicit env vars, no shell
+    ;; injection risk from the ARGS" shape on top of a single shell
+    ;; string, by single-quoting every argument/value exactly the way
+    ;; nix.rs's own `safe_nix_env_cmd` already single-quoted its args
+    ;; before this port existed.
+
+    ;; POSIX single-quote a value: close the quote, emit an escaped
+    ;; literal quote, reopen the quote.
+    pub fn shell_quote(s: string) -> string is
+        return "'" + str::replace_all(s, "'", "'\\''") + "'"
+    end
+
+    ;; Build a safe `VAR1='v1' VAR2='v2' program 'arg1' 'arg2'` line.
+    ;; `env_pairs` is a flat array: [key1, val1, key2, val2, ...].
+    pub fn build_shell_cmd(program: string, args: [string], env_pairs: [string]) -> string is
+        let mut out: string = ""
+        let mut i: int = 0
+        while i + 1 < env_pairs.len() is
+            out = out + env_pairs[i] + "=" + shell_quote(env_pairs[i + 1]) + " "
+            i = i + 2
+        end
+        out = out + shell_quote(program)
+        let mut j: int = 0
+        while j < args.len() is
+            out = out + " " + shell_quote(args[j])
+            j = j + 1
+        end
+        return out
+    end
+
+end
