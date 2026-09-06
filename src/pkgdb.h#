@@ -1,0 +1,202 @@
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+use "std -> env"     from "env"
+use "std -> time"    from "time"
+
+mod pkgdb is
+
+    struct Entry is
+        pub attr:        string
+        pub name:        string
+        pub version:     string
+        pub description: string
+    end
+
+    pub fn db_path() -> string is
+        return path::join(config::data_dir(), "pkgdb.tsv")
+    end
+
+    fn parse_row(line: string) -> Entry is
+        let parts: [string] = str::splitn(line, "\t", 4)
+        let mut attr: string = ""
+        let mut name: string = ""
+        let mut version: string = ""
+        let mut description: string = ""
+        if parts.len() > 0 is attr = parts[0] end
+        if parts.len() > 1 is name = parts[1] end
+        if parts.len() > 2 is version = parts[2] end
+        if parts.len() > 3 is description = parts[3] end
+        return Entry { attr: attr, name: name, version: version, description: description }
+    end
+
+    ;; Search the local cache. Fast, and — unlike the original's
+    ;; streamed-from-disk BufReader — reads the whole file into memory
+    ;; first via `fs::read_lines`; still effectively instantaneous for
+    ;; a package index (tens of thousands of lines, single-digit MB).
+    pub fn search(query: string) -> [Entry] is
+        let p: string = db_path()
+        if !fs::exists(p) is return [] end
+
+        let q: string = str::to_lower(query)
+        let lines: [string] = fs::read_lines(p)
+        let mut results: [Entry] = []
+        let mut i: int = 0
+        while i < lines.len() is
+            let line: string = lines[i]
+            if line.len() > 0 is
+                let e: Entry = parse_row(line)
+                if str::index_of(str::to_lower(e.attr), q) >= 0 ||
+                   str::index_of(str::to_lower(e.name), q) >= 0 ||
+                   str::index_of(str::to_lower(e.description), q) >= 0 is
+                    results.push(e)
+                end
+            end
+            i = i + 1
+        end
+        return results
+    end
+
+    ;; Every entry in the index, in file order. `limit < 0` means
+    ;; unlimited (mirrors the original's `limit: Option<usize>`).
+    pub fn all(limit: int) -> [Entry] is
+        let p: string = db_path()
+        if !fs::exists(p) is return [] end
+
+        let lines: [string] = fs::read_lines(p)
+        let mut results: [Entry] = []
+        let mut i: int = 0
+        while i < lines.len() is
+            if lines[i].len() > 0 is
+                results.push(parse_row(lines[i]))
+                if limit >= 0 && results.len() >= limit is break end
+            end
+            i = i + 1
+        end
+        return results
+    end
+
+    ;; Freshness check ( < 7 days old ). [ADAPTED] H#'s `fs` module has
+    ;; no file-metadata "age" helper beyond `modified_time` (unix
+    ;; timestamp) — compared directly against `time::now_unix()`.
+    pub fn is_fresh() -> bool is
+        let p: string = db_path()
+        if !fs::exists(p) is return false end
+        let modified: int = fs::modified_time(p)
+        let age: int = time::now_unix() - modified
+        return age < (7 * 24 * 3600)
+    end
+
+    pub fn entry_count() -> int is
+        let p: string = db_path()
+        if !fs::exists(p) is return 0 end
+        return fs::read_lines(p).len()
+    end
+
+    ;; Rebuild the package database. See the module doc comment above
+    ;; for the streaming-vs-batch RAM tradeoff of this port.
+    ;;
+    ;; `log`/`elog` are callback-style closures exactly like the
+    ;; original's `impl Fn(&str)` parameters.
+    pub fn rebuild_db(log: fn(string), elog: fn(string)) -> int is
+        let h: string = config::home()
+        let p: string = db_path()
+        let tmp_path: string = p + ".tmp"
+        fs::mkdir(path::parent(p))
+
+        let defexpr: string       = path::join(h, ".nix-defexpr")
+        let nix_profile: string   = path::join(h, ".nix-profile/bin")
+        let nix_store_bin: string = "/nix/var/nix/profiles/default/bin"
+        let cur_path: string      = env::get("PATH")
+        let new_path: string      = nix_profile + ":" + nix_store_bin + ":" + cur_path
+
+        let channels_nixpkgs: string = path::join(h, ".nix-defexpr/channels/nixpkgs")
+        let channels_dir: string     = path::join(h, ".nix-defexpr/channels")
+        let mut nix_path: string = channels_dir
+        if fs::exists(channels_nixpkgs) is
+            nix_path = "nixpkgs=" + channels_nixpkgs + ":" + channels_dir
+        end
+
+        log("nix-env -qaP --description  [NIX_DEFEXPR=" + defexpr + ", NIX_PATH=" + nix_path + "]")
+        log("writing to " + tmp_path)
+
+        let env_pairs: [string] = [
+            "PATH", new_path,
+            "NIX_PATH", nix_path,
+            "NIX_DEFEXPR", defexpr,
+            "NIXPKGS_ALLOW_UNFREE", "1",
+            "GC_INITIAL_HEAP_SIZE", "67108864",
+            "GC_MAXIMUM_HEAP_SIZE", "838860800",
+        ]
+        let shell_cmd: string = util::build_shell_cmd("nix-env", ["-qaP", "--description"], env_pairs)
+        let result = proc_run_cmd(shell_cmd, 0)
+
+        let mut out_lines: [string] = []
+        let mut count: int = 0
+        let raw_lines: [string] = str::split(result.stdout, "\n")
+        let mut i: int = 0
+        while i < raw_lines.len() is
+            let line: string = str::trim_end(raw_lines[i])
+            if line.len() > 0 is
+                let cols: [string] = str::splitn(str::trim_start(line), " ", 3)
+                ;; `--description` output is whitespace-separated, not
+                ;; tab-separated: splitn on a literal space is a close
+                ;; approximation of Rust's `splitn(3, char::is_whitespace)`
+                ;; since nix-env collapses runs of spaces for this output.
+                let mut attr: string = ""
+                let mut name_ver: string = ""
+                let mut description: string = ""
+                if cols.len() > 0 is attr = str::trim(cols[0]) end
+                if cols.len() > 1 is name_ver = str::trim(cols[1]) end
+                if cols.len() > 2 is description = str::trim(cols[2]) end
+
+                let nv: [string] = util::split_name_version(name_ver)
+                let name: string = nv[0]
+                let version: string = nv[1]
+
+                let clean_desc: string = str::join(str::split_whitespace(description), " ")
+
+                out_lines.push(attr + "\t" + name + "\t" + version + "\t" + clean_desc)
+                count = count + 1
+                if count % 5000 == 0 is
+                    log("  indexed " + to_string(count) + " packages...")
+                end
+            end
+            i = i + 1
+        end
+
+        if result.stderr.len() > 0 is
+            let err_lines: [string] = str::split(result.stderr, "\n")
+            let mut j: int = 0
+            while j < err_lines.len() is
+                let l: string = err_lines[j]
+                if l.len() > 0 is
+                    if str::index_of(l, "error:") >= 0 is
+                        elog(l)
+                    else is
+                        log(l)
+                    end
+                end
+                j = j + 1
+            end
+        end
+
+        if count == 0 is
+            fs::remove(tmp_path)
+            let defexpr_exists: bool  = fs::exists(defexpr)
+            let channels_exists: bool = fs::exists(channels_nixpkgs)
+            elog("nix-env -qaP produced no output.")
+            elog("  NIX_DEFEXPR exists: " + to_string(defexpr_exists) + "  (~/.nix-defexpr)")
+            elog("  channels/nixpkgs:   " + to_string(channels_exists) + "  (~/.nix-defexpr/channels/nixpkgs)")
+            elog("  Fix: run `hnm unpack` to register the nixpkgs channel, then `hnm update` again.")
+            return -1
+        end
+
+        fs::write(tmp_path, str::join(out_lines, "\n") + "\n")
+        fs::rename(tmp_path, p)
+
+        log("package index built: " + to_string(count) + " packages")
+        return count
+    end
+
+end
