@@ -1,0 +1,139 @@
+use "std -> env"    from "env"
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> json"    from "json"
+use "std -> strings"  from "str"
+use "std -> conv"     from "conv"
+
+mod config is
+
+    struct HnmConfig is
+        pub nix_channel:     string
+        pub profile_dir:     string
+        pub auto_gc:         bool
+        pub max_generations: int
+    end
+
+    pub fn default_config() -> HnmConfig is
+        return HnmConfig {
+            nix_channel:     "https://nixos.org/channels/nixpkgs-unstable",
+            profile_dir:     profile_dir(),
+            auto_gc:         false,
+            max_generations: 10,
+        }
+    end
+
+    ;; H#'s `env::home()` reads $HOME directly (see std/env.h#) — the
+    ;; equivalent of Rust's `dirs::home_dir()` with the same "/root"
+    ;; fallback the original used.
+    pub fn home() -> string is
+        let h: string = env::home()
+        if h == "" is return "/root" end
+        return h
+    end
+
+    pub fn config_dir() -> string is
+        return path::join(path::join(home(), ".config"), "hnm")
+    end
+
+    pub fn profile_dir() -> string is
+        return path::join(path::join(home(), ".hnm"), "profile")
+    end
+
+    pub fn data_dir() -> string is
+        return path::join(path::join(home(), ".local/share"), "hnm")
+    end
+
+    ;; Path to the config file — historically config.toml, now config.hk
+    ;; (see docs/hnm.html#config). If an old config.toml is found and
+    ;; config.hk is not, it is migrated automatically.
+    pub fn config_path() -> string is
+        return path::join(config_dir(), "config.hk")
+    end
+
+    fn legacy_config_path() -> string is
+        return path::join(config_dir(), "config.toml")
+    end
+
+    ;; ─── very small legacy TOML reader ──────────────────────────────
+    ;; Just enough to migrate the handful of flat `key = value` lines
+    ;; HNM's old config.toml ever wrote — not a general TOML parser.
+    fn migrate_legacy_toml(raw: string) -> HnmConfig is
+        let mut cfg: HnmConfig = default_config()
+        let lines: [string] = str::split(raw, "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let line: string = str::trim(lines[i])
+            let eq: int = str::index_of(line, "=")
+            if eq >= 0 is
+                let key: string = str::trim(line[0..eq])
+                let mut val: string = str::trim(line[eq + 1..line.len()])
+                val = str::remove_prefix(val, "\"")
+                val = str::remove_suffix(val, "\"")
+
+                if key == "nix_channel" is cfg.nix_channel = val end
+                if key == "profile_dir" is cfg.profile_dir = val end
+                if key == "auto_gc" is cfg.auto_gc = (str::to_lower(val) == "true") end
+                if key == "max_generations" is
+                    if str::is_numeric(val) is
+                        cfg.max_generations = conv::str_to_int(val)
+                    end
+                end
+            end
+            i = i + 1
+        end
+        return cfg
+    end
+
+    ;; ─── HnmConfig <-> flat JSON conversion ─────────────────────────
+    fn to_json(cfg: HnmConfig) -> string is
+        let mut obj: string = json::object()
+        obj = json::set_str(obj, "nix_channel", cfg.nix_channel)
+        obj = json::set_str(obj, "profile_dir", cfg.profile_dir)
+        obj = json::set_bool(obj, "auto_gc", cfg.auto_gc)
+        obj = json::set_int(obj, "max_generations", cfg.max_generations)
+        return obj
+    end
+
+    fn from_json(raw: string) -> HnmConfig is
+        let default: HnmConfig = default_config()
+        if !json::has_key(raw, "nix_channel") is
+            ;; malformed/legacy file — fall back to defaults rather than
+            ;; hard-erroring, mirroring the original's tolerant behavior
+            return default
+        end
+        let mut cfg: HnmConfig = default
+        cfg.nix_channel = json::get_str(raw, "nix_channel")
+        cfg.profile_dir = json::get_str(raw, "profile_dir")
+        cfg.auto_gc     = json::get_bool(raw, "auto_gc")
+        let mg: int = json::get_int(raw, "max_generations")
+        if mg > 0 is cfg.max_generations = mg end
+        return cfg
+    end
+
+    ;; ─── public API ──────────────────────────────────────────────────
+
+    pub fn load() -> HnmConfig is
+        let p: string = config_path()
+
+        if !fs::exists(p) is
+            let mut cfg: HnmConfig = default_config()
+            if fs::exists(legacy_config_path()) is
+                let raw: string = fs::read(legacy_config_path())
+                cfg = migrate_legacy_toml(raw)
+                write("  · migrated ~/.config/hnm/config.toml -> config.hk")
+            end
+            save(cfg)
+            return cfg
+        end
+
+        let raw: string = fs::read(p)
+        return from_json(raw)
+    end
+
+    pub fn save(cfg: HnmConfig) is
+        fs::mkdir(config_dir())
+        fs::write(config_path(), to_json(cfg))
+    end
+
+end
