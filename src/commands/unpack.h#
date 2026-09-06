@@ -1,0 +1,154 @@
+use "std -> env"     from "env"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+use "std -> os"      from "os"
+
+mod cmd_unpack is
+
+    fn has_bin(name: string) -> bool is
+        let r = proc_run_cmd("which " + util::shell_quote(name) + " >/dev/null 2>&1", 10)
+        return r.exit_code == 0
+    end
+
+    ;; H#'s `std -> os` module exposes this as a real builtin
+    ;; (__builtin_os_is_root, a direct geteuid() check) — no shelling
+    ;; out needed here, unlike some of this port's other adaptations.
+
+    ;; Flat [key, val, ...] env vars for the channel-registration step
+    ;; (mirrors the original's `nix_path_env`).
+    fn nix_path_env() -> [string] is
+        let h: string = config::home()
+        let nix_bin: string = path::join(h, ".nix-profile/bin")
+        let nix_store_bin: string = "/nix/var/nix/profiles/default/bin"
+        let cur: string = env::get("PATH")
+        return [
+            "PATH", nix_bin + ":" + nix_store_bin + ":" + cur,
+            "NIXPKGS_ALLOW_UNFREE", "1",
+        ]
+    end
+
+    pub fn run() -> bool is
+        output::header("Bootstrap Nix  (hnm unpack)")
+
+        if os::is_root() is
+            output::warn("Running as root (sudo).")
+            output::dim("Nix single-user install works best as a regular user.")
+            output::dim("If install fails, try: su - youruser && hnm unpack")
+            write("")
+        end
+
+        ;; ── Step 1 — install Nix ─────────────────────────────────────
+        if nix::nix_ok() is
+            output::ok("Nix is already installed \xe2\x80\x94 skipping download")
+        else is
+            let mut dl: string = ""
+            if has_bin("curl") is dl = "curl -fsSL https://nixos.org/nix/install"
+            else is
+                if has_bin("wget") is dl = "wget -qO- https://nixos.org/nix/install" end
+            end
+
+            if dl == "" is
+                output::warn("Neither curl nor wget found.")
+                output::dim("Install one first:")
+                output::dim("  apt-get install curl   # Debian/Ubuntu")
+                output::dim("  dnf install curl       # Fedora/RHEL")
+                output::dim("  pacman -S curl         # Arch")
+                output::error("curl/wget not found")
+                return false
+            end
+
+            let task: progress::TaskProgress = progress::task(100, "installing nix")
+
+            if os::is_root() is
+                progress::warn(task, "running as root \xe2\x80\x94 Nix single-user install may have issues")
+                progress::warn(task, "recommend: run `hnm unpack` as a regular user instead")
+            end
+
+            let install_sh: string = dl + " | sh -s -- --no-daemon"
+            let r = proc_run_cmd(install_sh, 0)
+            progress::inc(task, 80)
+
+            if r.exit_code == 0 is
+                progress::inc(task, 20)
+                progress::finish_ok(task, "Nix installed")
+            else is
+                progress::finish_err(task, "installer exited with code " + to_string(r.exit_code))
+                output::warn("Checking if nix-env works anyway...")
+                proc_run_cmd(". /root/.nix-profile/etc/profile.d/nix.sh 2>/dev/null || . ~/.nix-profile/etc/profile.d/nix.sh 2>/dev/null; nix-env --version", 15)
+
+                if !nix::nix_ok() is
+                    write("")
+                    output::warn("Root install failed. Recommended fix:")
+                    output::dim("  1) Switch to a regular (non-root) user:")
+                    output::dim("       su - youruser")
+                    output::dim("  2) Run unpack as that user:")
+                    output::dim("       hnm unpack")
+                    output::dim("")
+                    output::dim("If you MUST use root, install dependencies first:")
+                    output::dim("  groupadd -r nixbld")
+                    output::dim("  for i in $(seq 1 32); do")
+                    output::dim("    useradd -g nixbld -G nixbld -M -N -r -s /sbin/nologin nixbld$i")
+                    output::dim("  done")
+                    output::dim("  Then run `hnm unpack` again.")
+                    output::error("Nix installation failed")
+                    return false
+                end
+                output::ok("nix-env works \xe2\x80\x94 continuing")
+            end
+        end
+
+        ;; ── Step 2 — report nix.sh location ─────────────────────────
+        let nix_sh: string = shellrc::find_nix_sh()
+        if nix_sh != "" is
+            output::ok("nix profile script: " + nix_sh)
+        else is
+            output::warn("nix.sh not found \xe2\x80\x94 you may need to open a new shell first")
+        end
+
+        ;; ── Step 3 — register nixpkgs-unstable channel ──────────────
+        let env_vars: [string] = nix_path_env()
+        let task2: progress::TaskProgress = progress::task(100, "registering nixpkgs channel")
+        progress::log(task2, "nix-channel --add https://nixos.org/channels/nixpkgs-unstable nixpkgs")
+
+        let add_ok: bool = progress::run_with_log_env(task2, "nix-channel",
+            ["--add", "https://nixos.org/channels/nixpkgs-unstable", "nixpkgs"], env_vars)
+        if !add_ok is
+            progress::warn(task2, "nix-channel --add returned non-zero (may already be set)")
+        end
+        progress::inc(task2, 30)
+
+        progress::set_msg(task2, "nix-channel --update")
+        progress::log(task2, "nix-channel --update")
+        let ok: bool = progress::run_with_log_env(task2, "nix-channel", ["--update"], env_vars)
+        progress::inc(task2, 70)
+
+        if ok is
+            progress::finish_ok(task2, "nixpkgs-unstable channel registered")
+        else is
+            progress::finish_err(task2, "nix-channel --update failed")
+            output::dim("Check internet connection, then run `hnm unpack` again.")
+            return false
+        end
+
+        ;; ── Step 4 — patch shell rc files ───────────────────────────
+        write("")
+        output::info("Patching shell RC files...")
+        shellrc::patch(path::join(config::profile_dir(), "bin"))
+
+        ;; ── Done ─────────────────────────────────────────────────────
+        write("")
+        output::ok("Nix is ready!")
+        write("")
+        output::info("Reload your shell:")
+        write("  source ~/.bashrc    # bash")
+        write("  source ~/.zshrc     # zsh")
+        write("  exec $SHELL         # any shell")
+        write("")
+        output::dim("Verify:          hnm check")
+        output::dim("Build pkg index: hnm update   (run once, takes ~2 min)")
+        output::dim("Search:          hnm search <package>")
+
+        return true
+    end
+
+end
