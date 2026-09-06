@@ -1,5 +1,6 @@
-// cargo
+// h#
+// bytes
+|| H#
 
-> cd source-code
-> cargo build --release
+> bytes build --release
 ;; if you dont have install nix: > hl run install-nix.hl
