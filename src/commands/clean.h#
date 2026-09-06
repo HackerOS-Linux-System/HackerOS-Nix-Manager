@@ -1,0 +1,57 @@
+use "std -> fs"   from "fs"
+use "std -> path" from "path"
+
+mod cmd_clean is
+
+    fn dir_size(p: string) -> int is
+        if fs::is_file(p) is return fs::size(p) end
+        let mut total: int = 0
+        if fs::is_dir(p) is
+            let names: [string] = fs::list_dir(p)
+            let mut i: int = 0
+            while i < names.len() is
+                total = total + dir_size(path::join(p, names[i]))
+                i = i + 1
+            end
+        end
+        return total
+    end
+
+    pub fn run() -> bool is
+        output::header("Clean HNM cache")
+
+        let cache_dir: string = path::join(path::join(config::home(), ".cache"), "hnm")
+        let mut freed: int = 0
+
+        if fs::exists(cache_dir) is
+            let size: int = dir_size(cache_dir)
+            fs::rmdir_all(cache_dir)
+            freed = freed + size
+            output::ok("removed " + cache_dir + "  (" + to_string(size) + " bytes)")
+        else is
+            output::dim(cache_dir + " \xe2\x80\x94 nothing to clean")
+        end
+
+        let nix_eval_cache: string = path::join(path::join(path::join(config::home(), ".cache"), "nix"), "eval-cache-v4")
+        if fs::exists(nix_eval_cache) is
+            let size: int = dir_size(nix_eval_cache)
+            fs::rmdir_all(nix_eval_cache)
+            freed = freed + size
+            output::ok("removed nix eval cache  (" + to_string(size) + " bytes)")
+        end
+
+        write("")
+        if freed > 0 is
+            let tenths: int = (freed * 10) / 1048576
+            let whole: int = tenths / 10
+            let frac: int = tenths % 10
+            output::ok("freed " + to_string(freed) + " bytes (" + to_string(whole) + "." + to_string(frac) + " MB)")
+        else is
+            output::ok("nothing to clean \xe2\x80\x94 cache is already empty")
+        end
+
+        output::dim("To free Nix store space, run:  hnm gc")
+        return true
+    end
+
+end
