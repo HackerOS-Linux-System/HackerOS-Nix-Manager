@@ -1,0 +1,200 @@
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> env"     from "env"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+use "std -> os"      from "os"
+
+pub const HNM_UPSTREAM_VERSION_URL: string =
+    "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Nix-Manager/main/version.hacker"
+pub const HNM_UPSTREAM_RELEASE_URL: string =
+    "https://github.com/HackerOS-Linux-System/HackerOS-Nix-Manager/releases/download"
+
+mod cmd_upgrade is
+
+    fn local_version_file() -> string is
+        return path::join(path::join(path::join(config::home(), ".hackeros"), "hnm"), "version.hacker")
+    end
+
+    fn tmp_version_file() -> string is
+        return path::join(os::temp_dir(), ".hnm_upstream_version.hacker")
+    end
+
+    ;; version.hacker format:
+    ;; [
+    ;;   0.1
+    ;; ]
+    fn parse_version(content: string) -> string is
+        let lines: [string] = str::split(content, "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let mut t: string = str::trim(lines[i])
+            t = str::replace_all(t, "[", "")
+            t = str::replace_all(t, "]", "")
+            t = str::trim(t)
+            if t != "" is
+                let mut all_ok: bool = true
+                let mut j: int = 0
+                while j < t.len() is
+                    let c: string = t[j..j + 1]
+                    if !str::is_numeric(c) && c != "." is all_ok = false end
+                    j = j + 1
+                end
+                if all_ok is return t end
+            end
+            i = i + 1
+        end
+        return ""
+    end
+
+    fn version_part(s: string, idx: int) -> int is
+        let parts: [string] = str::split(s, ".")
+        if idx >= parts.len() is return 0 end
+        if !str::is_numeric(parts[idx]) is return 0 end
+        return conv::str_to_int(parts[idx])
+    end
+
+    fn version_greater(upstream: string, local: string) -> bool is
+        let up: [string] = str::split(upstream, ".")
+        let lo: [string] = str::split(local, ".")
+        let mut max_len: int = up.len()
+        if lo.len() > max_len is max_len = lo.len() end
+
+        let mut i: int = 0
+        while i < max_len is
+            let ui: int = version_part(upstream, i)
+            let li: int = version_part(local, i)
+            if ui > li is return true end
+            if ui < li is return false end
+            i = i + 1
+        end
+        return false
+    end
+
+    fn curl_download(url: string, dest: string, task: progress::TaskProgress) -> bool is
+        progress::log(task, "curl -fsSL " + url + " -o " + dest)
+        let cmd: string = util::build_shell_cmd("curl", ["-fsSL", url, "-o", dest], [])
+        let r = proc_run_cmd(cmd, 120)
+        if r.exit_code != 0 is return false end
+        return true
+    end
+
+    pub fn run() -> bool is
+        output::header("HNM Self-Upgrade")
+
+        ;; ── 1. Read local version ────────────────────────────────────
+        let local_ver_path: string = local_version_file()
+        let mut local_version: string = ""
+        if fs::exists(local_ver_path) is
+            let content: string = fs::read(local_ver_path)
+            local_version = parse_version(content)
+            if local_version == "" is
+                output::error("cannot parse local version file at " + local_ver_path)
+                return false
+            end
+        else is
+            local_version = HNM_VERSION
+            output::warn("local version file not found at " + local_ver_path + " \xe2\x80\x94 creating with version " + local_version)
+            fs::mkdir(path::parent(local_ver_path))
+            fs::write(local_ver_path, "[\n  " + local_version + "\n]\n")
+        end
+
+        output::label("current version", local_version)
+
+        ;; ── 2. Download upstream version.hacker ─────────────────────
+        let task: progress::TaskProgress = progress::task(100, "checking for updates...")
+        progress::log(task, "fetching " + HNM_UPSTREAM_VERSION_URL)
+
+        let tmp: string = tmp_version_file()
+        let dl_ok: bool = curl_download(HNM_UPSTREAM_VERSION_URL, tmp, task)
+        progress::inc(task, 50)
+
+        if !dl_ok is
+            progress::finish_err(task, "download failed")
+            output::warn("Could not reach GitHub \xe2\x80\x94 check your internet connection.")
+            output::error("cannot check for updates")
+            return false
+        end
+        progress::finish_ok(task, "version info fetched")
+
+        ;; ── 3. Parse upstream version ────────────────────────────────
+        let upstream_content: string = fs::read(tmp)
+        fs::remove(tmp)
+
+        let upstream_version: string = parse_version(upstream_content)
+        if upstream_version == "" is
+            output::error("cannot parse upstream version.hacker")
+            return false
+        end
+
+        output::label("latest version", upstream_version)
+
+        ;; ── 4. Compare ───────────────────────────────────────────────
+        if !version_greater(upstream_version, local_version) is
+            write("")
+            output::ok("HNM is up to date  (v" + local_version + ")")
+            return true
+        end
+
+        write("")
+        output::info("New version available: " + local_version + " \xe2\x86\x92 " + upstream_version)
+        write("")
+
+        ;; ── 5. Download new binary ───────────────────────────────────
+        let download_url: string = HNM_UPSTREAM_RELEASE_URL + "/v" + upstream_version + "/hnm"
+        let tmp_bin: string = path::join(os::temp_dir(), ".hnm_upgrade_bin")
+
+        let task2: progress::TaskProgress = progress::task(100, "downloading hnm v" + upstream_version)
+        progress::log(task2, "curl -fsSL " + download_url + " -o " + tmp_bin)
+        let dl2_ok: bool = curl_download(download_url, tmp_bin, task2)
+        progress::inc(task2, 70)
+
+        if !dl2_ok is
+            progress::finish_err(task2, "download failed")
+            output::error("failed to download new binary")
+            return false
+        end
+        progress::inc(task2, 30)
+        progress::finish_ok(task2, "binary downloaded")
+
+        ;; ── 6. chmod +x ──────────────────────────────────────────────
+        let chmod_r = proc_run_cmd("chmod a+x " + util::shell_quote(tmp_bin), 10)
+        if chmod_r.exit_code != 0 is
+            output::error("chmod a+x failed on downloaded binary")
+            return false
+        end
+
+        ;; ── 7. sudo mv to /usr/bin/hnm ─────────────────────────────
+        output::info("Installing to /usr/bin/hnm  (requires sudo)...")
+
+        let task3: progress::TaskProgress = progress::task(100, "installing to /usr/bin/hnm")
+        progress::log(task3, "sudo rm -rf /usr/bin/hnm")
+        let rm_r = proc_run_cmd("sudo rm -rf /usr/bin/hnm", 30)
+        if rm_r.exit_code != 0 is
+            progress::finish_err(task3, "sudo rm /usr/bin/hnm failed")
+            output::error("failed to remove old /usr/bin/hnm \xe2\x80\x94 do you have sudo?")
+            return false
+        end
+        progress::inc(task3, 30)
+
+        progress::log(task3, "sudo mv " + tmp_bin + " /usr/bin/hnm")
+        let mv_r = proc_run_cmd("sudo mv " + util::shell_quote(tmp_bin) + " /usr/bin/hnm", 30)
+        if mv_r.exit_code != 0 is
+            progress::finish_err(task3, "sudo mv failed")
+            output::error("failed to move binary to /usr/bin/hnm")
+            return false
+        end
+        progress::inc(task3, 70)
+        progress::finish_ok(task3, "hnm v" + upstream_version + " installed to /usr/bin/hnm")
+
+        ;; ── 8. Update local version file ────────────────────────────
+        fs::write(local_ver_path, "[\n  " + upstream_version + "\n]\n")
+
+        write("")
+        output::ok("HNM upgraded  v" + local_version + "  \xe2\x86\x92  v" + upstream_version)
+        output::dim("Run `hnm version` to confirm.")
+
+        return true
+    end
+
+end
