@@ -1,0 +1,441 @@
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> env"     from "env"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+use "std -> sort"    from "sort"
+
+mod nix is
+
+    struct Pkg is
+        pub name:        string
+        pub version:     string
+        pub attr_path:   string
+        pub description: string
+        pub homepage:    string ;; "" == None
+        pub license:     string ;; "" == None
+    end
+
+    ;; ── presence checks ─────────────────────────────────────────────
+
+    pub fn nix_ok() -> bool is
+        let r = proc_run_cmd("nix-env --version >/dev/null 2>&1", 10)
+        return r.exit_code == 0
+    end
+
+    pub fn ensure_nix() -> bool is
+        if nix_ok() is return true end
+        output::warn("Nix is not installed \xe2\x80\x94 bootstrapping automatically...")
+        return cmd_unpack::run()
+    end
+
+    ;; ── env setup ────────────────────────────────────────────────────
+    ;; Returns a flat [key, val, key, val, ...] array — see
+    ;; util::build_shell_cmd, which consumes exactly this shape.
+    ;;
+    ;; KEY INSIGHT (kept from the original): GC_INITIAL_HEAP_SIZE limits
+    ;; the Boehm GC heap used by the Nix evaluator. Default is 384 MiB —
+    ;; kept low here to avoid OOM on small machines.
+    pub fn pub_nix_env_vars() -> [string] is
+        let h: string = config::home()
+
+        let nix_profile_bin: string = path::join(h, ".nix-profile/bin")
+        let nix_default_bin: string = "/nix/var/nix/profiles/default/bin"
+        let cur_path: string = env::get("PATH")
+        let new_path: string = nix_profile_bin + ":" + nix_default_bin + ":" + cur_path
+
+        let channels_nixpkgs: string = path::join(h, ".nix-defexpr/channels/nixpkgs")
+        let channels_dir: string     = path::join(h, ".nix-defexpr/channels")
+        let mut nix_path: string = "nixpkgs=" + channels_dir
+        if fs::exists(channels_nixpkgs) is
+            nix_path = "nixpkgs=" + channels_nixpkgs + ":" + channels_dir
+        end
+
+        return [
+            "PATH", new_path,
+            "NIX_PATH", nix_path,
+            "NIXPKGS_ALLOW_UNFREE", "1",
+            "GC_INITIAL_HEAP_SIZE", "67108864",
+            "GC_MAXIMUM_HEAP_SIZE", "838860800",
+        ]
+    end
+
+    fn nix_env_vars() -> [string] is
+        return pub_nix_env_vars()
+    end
+
+    ;; Whether `systemd-run` is available, to memory-wrap nix-env calls.
+    fn has_systemd_run() -> bool is
+        let r = proc_run_cmd("systemd-run --version >/dev/null 2>&1", 10)
+        return r.exit_code == 0
+    end
+
+    ;; Build the full, safe nix-env shell command: proper NIX_PATH/GC
+    ;; env vars, `systemd-run --scope` memory wrapper if available,
+    ;; else an `ulimit -v` fallback — same two-path strategy as the
+    ;; original's `safe_nix_env_cmd`.
+    fn safe_nix_env_cmd(nix_args: [string]) -> string is
+        let env_vars: [string] = nix_env_vars()
+
+        if has_systemd_run() is
+            let wrapper_args: [string] = [
+                "--scope", "--user",
+                "-p", "MemoryMax=2G",
+                "-p", "MemorySwapMax=512M",
+                "--", "nix-env",
+            ]
+            let mut all_args: [string] = wrapper_args
+            let mut i: int = 0
+            while i < nix_args.len() is
+                all_args.push(nix_args[i])
+                i = i + 1
+            end
+            return util::build_shell_cmd("systemd-run", all_args, env_vars)
+        end
+
+        ;; no systemd-run: ulimit -v 2G fallback via sh -c
+        let mut quoted: [string] = []
+        let mut j: int = 0
+        while j < nix_args.len() is
+            quoted.push(util::shell_quote(nix_args[j]))
+            j = j + 1
+        end
+        let inner: string = "ulimit -v 2097152; exec nix-env " + str::join(quoted, " ")
+        return util::build_shell_cmd("sh", ["-c", inner], env_vars)
+    end
+
+    ;; ── search ───────────────────────────────────────────────────────
+    ;; Search uses the LOCAL package database (~/.local/share/hnm/pkgdb.tsv),
+    ;; built once by `hnm update`. Instantaneous, zero extra RAM.
+
+    pub fn search(query: string, task: progress::TaskProgress) -> [Pkg] is
+        if !fs::exists(pkgdb::db_path()) is
+            progress::warn(task, "package index not built yet")
+            progress::warn(task, "run `hnm update` first to build the local package index")
+            progress::log(task, "(this takes ~1-2 min but only needs to run once per update)")
+            return []
+        end
+
+        let count: int = pkgdb::entry_count()
+        progress::log(task, "searching local index (" + to_string(count) + " packages)...")
+        progress::set_msg(task, "searching " + to_string(count) + " packages")
+
+        let results: [pkgdb::Entry] = pkgdb::search(query)
+
+        ;; the local index (pkgdb.tsv) also stores a description column
+        ;; (see pkgdb::rebuild_db), so search results carry a real
+        ;; description — `hnm info <pkg>` still does a live nix-env
+        ;; query for homepage/license, which the bulk index doesn't carry.
+        let mut pkgs: [Pkg] = []
+        let mut i: int = 0
+        while i < results.len() is
+            let e: pkgdb::Entry = results[i]
+            let short: string = str::remove_prefix(e.attr, "nixpkgs.")
+            pkgs.push(Pkg {
+                name: short, version: e.version, attr_path: e.attr,
+                description: e.description, homepage: "", license: "",
+            })
+            i = i + 1
+        end
+
+        progress::inc(task, 100)
+        return pkgs
+    end
+
+    ;; ── nixpkgs config ──────────────────────────────────────────────
+    ;; Ensure ~/.config/nixpkgs/config.nix exists with allowUnfree = true
+    ;; (needed for steam/vscode/discord/etc). Idempotent.
+    pub fn ensure_nixpkgs_config() is
+        let config_dir: string  = path::join(path::join(config::home(), ".config"), "nixpkgs")
+        let config_file: string = path::join(config_dir, "config.nix")
+
+        if fs::exists(config_file) is
+            let contents: string = fs::read(config_file)
+            if str::index_of(contents, "allowUnfree") >= 0 is return end
+        end
+
+        fs::mkdir(config_dir)
+        fs::write(config_file, "{ allowUnfree = true; }\n")
+    end
+
+    ;; ── install ──────────────────────────────────────────────────────
+    ;; IMPORTANT: use -iA nixpkgs.<name> (attribute path), NOT -i <name>
+    ;; (bare name) — -iA evaluates only ONE attribute (small footprint);
+    ;; plain -i scans the entire nixpkgs tree and can OOM.
+
+    pub fn install(bare_name: string, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        fs::mkdir(path::parent(profile))
+
+        let attr: string = "nixpkgs." + bare_name
+        progress::log(task, "nix-env --profile " + profile + " -iA " + attr + "  [GC_INITIAL_HEAP_SIZE=64M]")
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "-iA", attr])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+
+        if !ok is
+            output::error("nix-env -iA " + attr + " failed \xe2\x80\x94 check that the package name is correct.")
+            output::dim("Tip: run `hnm search " + bare_name + "` first to find the exact attribute path")
+            return false
+        end
+        return true
+    end
+
+    ;; ── remove ───────────────────────────────────────────────────────
+
+    pub fn remove(pkg_name: string, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        progress::log(task, "nix-env --profile " + profile + " --uninstall " + pkg_name)
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "--uninstall", pkg_name])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+
+        if !ok is
+            output::error("nix-env --uninstall failed for '" + pkg_name + "'")
+            return false
+        end
+        return true
+    end
+
+    ;; ── update ───────────────────────────────────────────────────────
+
+    pub fn update_channel(task: progress::TaskProgress) -> bool is
+        let cfg: config::HnmConfig = config::load()
+        progress::log(task, "nix-channel --add " + cfg.nix_channel + " nixpkgs")
+        let add_cmd: string = util::build_shell_cmd("nix-channel", ["--add", cfg.nix_channel, "nixpkgs"], nix_env_vars())
+        proc_run_cmd(add_cmd, 0)
+
+        progress::set_msg(task, "nix-channel --update")
+        progress::log(task, "nix-channel --update")
+        let upd_cmd: string = util::build_shell_cmd("nix-channel", ["--update"], nix_env_vars())
+        let ok: bool = progress::run_cmd_log(task, upd_cmd, 0)
+
+        if !ok is
+            output::error("nix-channel --update failed")
+            return false
+        end
+        return true
+    end
+
+    ;; Upgrade a single package by attribute. Uses -iA which is O(1) in
+    ;; nixpkgs size — safe for low-RAM machines.
+    pub fn upgrade_one(pkg_name: string, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        let attr: string = "nixpkgs." + pkg_name
+        progress::log(task, "nix-env --profile " + profile + " -iA " + attr + "  [upgrade]")
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "-iA", attr])
+        return progress::run_cmd_log(task, cmd, 0)
+    end
+
+    ;; ── info ─────────────────────────────────────────────────────────
+
+    pub fn info(name: string) -> Pkg is
+        let attr: string = "nixpkgs." + name
+        let cmd: string = util::build_shell_cmd("nix-env", ["--query", "--available", "-A", attr, "--json"], nix_env_vars())
+        let r = proc_run_cmd(cmd, 60)
+
+        if r.exit_code == 0 && r.stdout.len() > 0 is
+            let unwrapped: [string] = nixjson::unwrap_single_entry(r.stdout)
+            let attr_key: string = unwrapped[0]
+            let body: string = unwrapped[1]
+            if attr_key != "" is
+                let mut pname: string = nixjson::field(body, "pname")
+                if pname == "" is pname = nixjson::field(body, "name") end
+                if pname == "" is pname = name end
+
+                let mut version: string = nixjson::field(body, "version")
+                if version == "" is version = "?" end
+
+                let meta: string = nixjson::object_field(body, "meta")
+                let mut description: string = nixjson::field(meta, "description")
+                if description == "" is description = nixjson::field(body, "description") end
+
+                let homepage: string = nixjson::field(meta, "homepage")
+
+                let license_obj: string = nixjson::object_field(meta, "license")
+                let mut license: string = ""
+                if license_obj != "" is
+                    license = nixjson::field(license_obj, "spdxId")
+                end
+                if license == "" is license = nixjson::field(meta, "license") end
+
+                return Pkg {
+                    name: pname, version: version, attr_path: attr_key,
+                    description: description, homepage: homepage, license: license,
+                }
+            end
+        end
+
+        output::error("package '" + name + "' not found \xe2\x80\x94 try `hnm search " + name + "`")
+        return Pkg { name: "", version: "", attr_path: "", description: "", homepage: "", license: "" }
+    end
+
+    ;; ── list installed ───────────────────────────────────────────────
+
+    pub fn list_profile() -> [Pkg] is
+        let profile: string = config::profile_dir()
+        let cmd: string = util::build_shell_cmd("nix-env", ["--profile", profile, "--query", "--installed", "--json"], nix_env_vars())
+        let r = proc_run_cmd(cmd, 60)
+
+        if r.exit_code != 0 is return [] end
+        let raw: string = str::trim(r.stdout)
+        if raw == "" || raw == "{}" is return [] end
+
+        let mut pkgs: [Pkg] = []
+        ;; the profile-query JSON is `{"<name>": {...}, "<name2>": {...}}`
+        ;; — a flat map of *possibly several* entries, unlike `info`'s
+        ;; guaranteed single entry, so it's walked manually here rather
+        ;; than via `unwrap_single_entry`.
+        let inner: string = raw[1..raw.len() - 1]
+        let mut pos: int = 0
+        while pos < inner.len() is
+            let rest: string = inner[pos..inner.len()]
+            let colon_brace: int = str::index_of(rest, "\":{")
+            if colon_brace < 0 is pos = inner.len() else is
+                let quote_before: int = str::index_of(rest, "\"")
+                let name: string = rest[quote_before + 1..colon_brace]
+
+                let mut i: int = colon_brace + 2
+                let mut depth: int = 0
+                let mut body: string = ""
+                let n: int = rest.len()
+                while i < n is
+                    let ch: string = rest[i..i + 1]
+                    body = body + ch
+                    if ch == "{" is depth = depth + 1 end
+                    if ch == "}" is
+                        depth = depth - 1
+                        if depth == 0 is i = n end
+                    end
+                    i = i + 1
+                end
+
+                let meta: string = nixjson::object_field(body, "meta")
+                let mut description: string = nixjson::field(meta, "description")
+                if description == "" is description = nixjson::field(body, "description") end
+                let mut version: string = nixjson::field(body, "version")
+                if version == "" is version = "?" end
+
+                pkgs.push(Pkg {
+                    name: name, version: version, attr_path: name,
+                    description: description, homepage: "", license: "",
+                })
+
+                pos = pos + colon_brace + 2 + body.len()
+            end
+        end
+
+        sort::sort_by_key(pkgs, |p: any| -> any is return p.name end)
+        return pkgs
+    end
+
+    ;; ── gc ───────────────────────────────────────────────────────────
+
+    pub fn gc(task: progress::TaskProgress) -> bool is
+        progress::log(task, "nix-store --gc")
+        let cmd: string = util::build_shell_cmd("nix-store", ["--gc"], nix_env_vars())
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+        if !ok is
+            output::error("nix-store --gc failed")
+            return false
+        end
+        return true
+    end
+
+    ;; ── generations ──────────────────────────────────────────────────
+    ;; Each row: [num_as_string, date, is_current_as_"true"/"false"].
+
+    pub fn list_generations() -> [[string]] is
+        let profile: string = config::profile_dir()
+        let cmd: string = util::build_shell_cmd("nix-env", ["--profile", profile, "--list-generations"], nix_env_vars())
+        let r = proc_run_cmd(cmd, 30)
+
+        let mut gens: [[string]] = []
+        let lines: [string] = str::split(r.stdout, "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let line: string = lines[i]
+            let parts: [string] = str::split_whitespace(line)
+            if parts.len() >= 2 is
+                let num: string = parts[0]
+                let date: string = parts[1]
+                let current: bool = str::index_of(line, "(current)") >= 0
+                let mut cur_s: string = "false"
+                if current is cur_s = "true" end
+                gens.push([num, date, cur_s])
+            end
+            i = i + 1
+        end
+        return gens
+    end
+
+    pub fn switch_generation(gen: int, task: progress::TaskProgress) -> bool is
+        let profile: string = config::profile_dir()
+        progress::log(task, "nix-env --profile " + profile + " --switch-generation " + to_string(gen))
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "--switch-generation", to_string(gen)])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+        if !ok is
+            output::error("failed to switch to generation " + to_string(gen))
+            return false
+        end
+        return true
+    end
+
+    ;; The generation number nix-env currently has active. -1 == none.
+    pub fn current_generation() -> int is
+        let gens: [[string]] = list_generations()
+        let mut i: int = 0
+        while i < gens.len() is
+            if gens[i][2] == "true" is return conv::str_to_int(gens[i][0]) end
+            i = i + 1
+        end
+        return -1
+    end
+
+    ;; Delete all but the `keep` most recent generations (current one is
+    ;; always kept regardless of age). `keep == 0` disables pruning.
+    ;; Returns the number of generations actually deleted.
+    pub fn prune_old_generations(keep: int, task: progress::TaskProgress) -> int is
+        if keep == 0 is return 0 end
+
+        let mut gens: [[string]] = list_generations()
+        if gens.len() <= keep is return 0 end
+
+        sort::sort_by_key(gens, |g: any| -> any is return conv::str_to_int(g[0]) end)
+
+        let cutoff: int = gens.len() - keep
+        let mut to_delete: [string] = []
+        let mut i: int = 0
+        while i < cutoff is
+            if gens[i][2] != "true" is to_delete.push(gens[i][0]) end
+            i = i + 1
+        end
+
+        if to_delete.len() == 0 is return 0 end
+
+        let profile: string = config::profile_dir()
+        let list_arg: string = str::join(to_delete, " ")
+        progress::log(task, "nix-env --profile " + profile + " --delete-generations " + list_arg)
+
+        let cmd: string = safe_nix_env_cmd(["--profile", profile, "--delete-generations", list_arg])
+        let ok: bool = progress::run_cmd_log(task, cmd, 0)
+
+        if !ok is
+            output::error("nix-env --delete-generations failed")
+            return 0
+        end
+        return to_delete.len()
+    end
+
+    ;; ── store du ─────────────────────────────────────────────────────
+
+    pub fn store_du() -> string is
+        let r = proc_run_cmd("du -sh /nix/store 2>/dev/null", 30)
+        if r.exit_code != 0 is return "?" end
+        let parts: [string] = str::split_whitespace(r.stdout)
+        if parts.len() == 0 is return "?" end
+        return parts[0]
+    end
+
+end
