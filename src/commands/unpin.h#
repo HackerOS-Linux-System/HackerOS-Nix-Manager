@@ -1,0 +1,16 @@
+mod cmd_unpin is
+
+    pub fn run(package: string) -> bool is
+        if !nix::ensure_nix() is return false end
+
+        if !state::is_installed(package) is
+            output::error("'" + package + "' is not installed")
+            return false
+        end
+
+        state::unpin(package)
+        output::ok("'" + package + "' is now unpinned \xe2\x80\x94 it will be updated by `hnm update`")
+        return true
+    end
+
+end
