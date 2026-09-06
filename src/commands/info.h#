@@ -1,0 +1,37 @@
+use "std -> time" from "time"
+
+mod cmd_info is
+
+    pub fn run(package: string) -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Package info \xe2\x80\x94 " + package)
+
+        let pkg: nix::Pkg = nix::info(package)
+        if pkg.name == "" is return false end ;; nix::info already printed the error
+
+        output::label("name",    pkg.name)
+        output::label("version", pkg.version)
+        output::label("attr",    pkg.attr_path)
+        if pkg.description != "" is output::label("description", pkg.description) end
+        if pkg.homepage    != "" is output::label("homepage", pkg.homepage) end
+        if pkg.license     != "" is output::label("license", pkg.license) end
+
+        let installed: bool = state::is_installed(package)
+        let mut installed_label: string = "no"
+        if installed is installed_label = "yes \xe2\x9c\x93" end
+        output::label("installed", installed_label)
+
+        let p: state::InstalledPkg = state::get(package)
+        if p.name != "" is
+            output::label("installed at", time::format(p.installed_at, "%Y-%m-%d %H:%M UTC"))
+            if p.pinned != "" is output::label("pinned to", p.pinned) end
+        end
+
+        write("")
+        if !installed is
+            output::dim("hnm install " + package + "   to install")
+        end
+        return true
+    end
+
+end
