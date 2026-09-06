@@ -1,0 +1,128 @@
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+
+pub const HNM_SHELLRC_MARKER: string = "# HNM \xe2\x80\x94 HackerOS Nix Manager"
+
+mod shellrc is
+
+    fn rc_files() -> [string] is
+        return [".bashrc", ".zshrc", ".profile"]
+    end
+
+    ;; Locate the Nix profile activation script (nix.sh), if any.
+    ;; "" means none found (H# port convention — see PORTING-NOTES.md).
+    pub fn find_nix_sh() -> string is
+        let h: string = config::home()
+        let candidates: [string] = [
+            path::join(h, ".nix-profile/etc/profile.d/nix.sh"),
+            "/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh",
+            "/etc/profile.d/nix.sh",
+            path::join(h, ".local/state/nix/profiles/profile/etc/profile.d/nix.sh"),
+            "/root/.nix-profile/etc/profile.d/nix.sh",
+        ]
+        let mut i: int = 0
+        while i < candidates.len() is
+            if fs::exists(candidates[i]) is return candidates[i] end
+            i = i + 1
+        end
+        return ""
+    end
+
+    fn block_for(profile_bin: string) -> string is
+        let nix_sh: string = find_nix_sh()
+        let mut nix_sh_line: string = ""
+        if nix_sh != "" is
+            nix_sh_line = "[ -f '" + nix_sh + "' ] && . '" + nix_sh + "'"
+        else is
+            nix_sh_line = "[ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \\\n    . ~/.nix-profile/etc/profile.d/nix.sh"
+        end
+        return "\n" + HNM_SHELLRC_MARKER + "\n" +
+               "export PATH=\"" + profile_bin + ":$HOME/.nix-profile/bin:$PATH\"\n" +
+               nix_sh_line + "\n"
+    end
+
+    ;; Append the HNM PATH block to every rc file that exists and isn't
+    ;; already patched. Returns the list of files that were newly patched.
+    pub fn patch(profile_bin: string) -> [string] is
+        let h: string = config::home()
+        let block: string = block_for(profile_bin)
+        let mut patched: [string] = []
+        let files: [string] = rc_files()
+
+        let mut i: int = 0
+        while i < files.len() is
+            let rc: string = files[i]
+            let rc_path: string = path::join(h, rc)
+            if fs::exists(rc_path) is
+                let content: string = fs::read(rc_path)
+                if str::index_of(content, HNM_SHELLRC_MARKER) >= 0 is
+                    output::dim("~/" + rc + " \xe2\x80\x94 already patched")
+                else is
+                    fs::append(rc_path, block)
+                    output::ok("patched ~/" + rc)
+                    patched.push(rc)
+                end
+            end
+            i = i + 1
+        end
+        return patched
+    end
+
+    ;; Remove the HNM block (marker line + the two lines after it) from
+    ;; every rc file that has it. Returns the list of files unpatched.
+    pub fn unpatch() -> [string] is
+        let h: string = config::home()
+        let mut unpatched: [string] = []
+        let files: [string] = rc_files()
+
+        let mut fi: int = 0
+        while fi < files.len() is
+            let rc: string = files[fi]
+            let rc_path: string = path::join(h, rc)
+            if fs::exists(rc_path) is
+                let content: string = fs::read(rc_path)
+                if str::index_of(content, HNM_SHELLRC_MARKER) >= 0 is
+                    let lines: [string] = str::split(content, "\n")
+                    let mut out_lines: [string] = []
+                    let mut skip_remaining: int = 0
+                    let mut li: int = 0
+                    while li < lines.len() is
+                        let line: string = lines[li]
+                        if skip_remaining > 0 is
+                            skip_remaining = skip_remaining - 1
+                        else is
+                            if str::trim(line) == HNM_SHELLRC_MARKER is
+                                skip_remaining = 2
+                            else is
+                                out_lines.push(line)
+                            end
+                        end
+                        li = li + 1
+                    end
+
+                    ;; collapse runs of blank lines left behind
+                    let mut cleaned: string = ""
+                    let mut prev_blank: bool = false
+                    let mut oi: int = 0
+                    while oi < out_lines.len() is
+                        let l: string = out_lines[oi]
+                        let is_blank: bool = str::trim(l) == ""
+                        if !(is_blank && prev_blank) is
+                            cleaned = cleaned + l + "\n"
+                        end
+                        prev_blank = is_blank
+                        oi = oi + 1
+                    end
+
+                    fs::write(rc_path, cleaned)
+                    output::ok("unpatched ~/" + rc)
+                    unpatched.push(rc)
+                end
+            end
+            fi = fi + 1
+        end
+        return unpatched
+    end
+
+end
