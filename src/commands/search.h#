@@ -1,0 +1,50 @@
+use "std -> strings" from "str"
+
+mod cmd_search is
+
+    fn pkg_json(p: nix::Pkg) -> string is
+        return "{\"name\":\"" + p.name + "\",\"version\":\"" + p.version +
+               "\",\"attr_path\":\"" + p.attr_path + "\",\"description\":\"" + p.description + "\"}"
+    end
+
+    pub fn run(query: string, json: bool) -> bool is
+        if !nix::ensure_nix() is return false end
+
+        let task: progress::TaskProgress = progress::task(100, "searching for '" + query + "'")
+        let results: [nix::Pkg] = nix::search(query, task)
+        progress::finish_ok(task, "done")
+        write("")
+
+        if results.len() == 0 is
+            output::warn("no packages found matching '" + query + "'")
+            return true
+        end
+
+        if json is
+            let mut rows: [string] = []
+            let mut i: int = 0
+            while i < results.len() is
+                rows.push(pkg_json(results[i]))
+                i = i + 1
+            end
+            write("[\n  " + str::join(rows, ",\n  ") + "\n]")
+            return true
+        end
+
+        output::header("Search  '" + query + "'   (" + to_string(results.len()) + " results)")
+        output::table_header()
+
+        let mut j: int = 0
+        while j < results.len() is
+            let p: nix::Pkg = results[j]
+            output::table_row(p.name, p.version, p.description, state::is_installed(p.name))
+            j = j + 1
+        end
+
+        write("")
+        output::dim("hnm install <package>   to install")
+        output::dim("hnm info    <package>   for details")
+        return true
+    end
+
+end
