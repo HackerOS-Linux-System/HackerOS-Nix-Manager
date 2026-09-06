@@ -1,0 +1,116 @@
+use "std -> fmt"     from "fmt"
+use "std -> cli"     from "cli"
+use "std -> strings" from "str"
+use "std -> os"      from "os"
+
+;; Compile-time-ish version string. Cargo baked CARGO_PKG_VERSION into
+;; the original binary at build time; H# has no build-time env
+;; substitution, so this is a plain top-level constant instead — kept
+;; in sync with version.hacker by convention (see PORTING-NOTES.md).
+pub const HNM_VERSION: string = "0.2"
+
+mod output is
+
+    ;; ── raw ANSI helpers not covered by std -> fmt ──────────────────
+    fn bright_cyan(s: string) -> string is return "\x1b[96m" + s + "\x1b[0m" end
+    fn cyan(s: string)        -> string is return "\x1b[36m" + s + "\x1b[0m" end
+    fn red_bold_ul(s: string) -> string is return "\x1b[1;4;31m" + s + "\x1b[0m" end
+    fn yellow_ul(s: string)   -> string is return "\x1b[4;33m" + s + "\x1b[0m" end
+    fn bright_cyan_bold(s: string) -> string is return "\x1b[1;96m" + s + "\x1b[0m" end
+    fn cyan_bold_ul(s: string) -> string is return "\x1b[1;4;36m" + s + "\x1b[0m" end
+    fn cyan_dim(s: string)     -> string is return "\x1b[2;36m" + s + "\x1b[0m" end
+
+    pub fn error(msg: string) is
+        write(red_bold_ul(" ERROR ") + " " + red_bold_ul(msg))
+    end
+
+    pub fn warn(msg: string) is
+        write(yellow_ul(" WARN ") + " " + yellow_ul(msg))
+    end
+
+    pub fn ok(msg: string) is
+        write(bright_cyan_bold("\xe2\x9c\x93") + " " + bright_cyan(msg))
+    end
+
+    pub fn info(msg: string) is
+        write(cyan("\xc2\xb7") + " " + msg)
+    end
+
+    pub fn dim(msg: string) is
+        write("  " + cyan_dim(msg))
+    end
+
+    pub fn header(title: string) is
+        let bar: string = fmt::repeat("\xe2\x94\x80", title.len() + 4)
+        write("")
+        write("  " + bright_cyan_bold("\xe2\x96\xb8") + " " + bright_cyan_bold(title))
+        write("  " + cyan_dim(bar))
+    end
+
+    pub fn label(key: string, val: string) is
+        write("  " + fmt::pad_left(cyan(key), 16 + 9) + "  " + bright_cyan(val))
+        ;; NOTE: `fmt::pad_left` pads on the raw (ANSI-included) string,
+        ;; so the +9 compensates for the injected escape-code length to
+        ;; keep the visible column width at 16, matching Rust's
+        ;; `{:>16}` on the *plain* text.
+    end
+
+    pub fn table_header() is
+        write("  " + fmt::pad_right(cyan_bold_ul("PACKAGE"), 32 + 18) + "  " +
+                     fmt::pad_right(cyan_bold_ul("VERSION"), 14 + 18) + "  " +
+                     cyan_bold_ul("DESCRIPTION"))
+        write("  " + cyan_dim(fmt::repeat("\xe2\x94\x80", 80)))
+    end
+
+    pub fn table_row(name: string, version: string, desc: string, is_installed: bool) is
+        let mut marker: string = ""
+        if is_installed is marker = " \xe2\x9c\x93" end
+        let full_name: string = name + marker
+        let short_desc: string = fmt::truncate(desc, 52)
+        write("  " + fmt::pad_right(bright_cyan_bold(full_name), full_name.len() + 34) + "  " +
+                     fmt::pad_right(cyan(version), version.len() + 16) + "  " +
+                     cyan_dim(short_desc))
+    end
+
+    pub fn log_line(msg: string) is
+        write("  " + cyan_dim("\xe2\x94\x82") + " " + cyan_dim(msg))
+    end
+
+    pub fn step(tag: string, msg: string) is
+        write("  " + bright_cyan_bold("[" + tag + "]") + " " + bright_cyan(msg))
+    end
+
+    ;; Ask a yes/no question on stdin, defaulting to "no" on empty
+    ;; input / EOF. Used by `hnm remove` (without --force) and
+    ;; `hnm env activate/deactivate` (without --yes).
+    pub fn confirm(prompt: string) -> bool is
+        return cli::confirm("  ? " + prompt)
+    end
+
+    pub fn version_info() is
+        write("")
+        write("  " + bright_cyan_bold("hnm") + " " + cyan("v") + bright_cyan_bold(hnm_version()))
+        write("  " + cyan("HackerOS Nix Manager"))
+        write("  " + cyan_dim("Part of the HackerOS ecosystem"))
+        write("")
+
+        let nix_r  = proc_run_cmd("nix --version", 5)
+        let mut nix_ver: string = "not installed"
+        if nix_r.exit_code == 0 is nix_ver = str::trim(nix_r.stdout) end
+
+        let env_r  = proc_run_cmd("nix-env --version", 5)
+        let mut nix_env_ver: string = "not installed"
+        if env_r.exit_code == 0 is nix_env_ver = str::trim(env_r.stdout) end
+
+        label("nix", nix_ver)
+        label("nix-env", nix_env_ver)
+        label("platform", os::platform())
+        label("arch", os::arch())
+        write("")
+    end
+
+    fn hnm_version() -> string is
+        return HNM_VERSION
+    end
+
+end
