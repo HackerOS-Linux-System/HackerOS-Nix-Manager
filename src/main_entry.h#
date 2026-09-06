@@ -1,0 +1,30 @@
+fn main() is
+    let cmd: cliapp::CliCommand = cliapp::parse()
+    let mut ok: bool = true
+
+    if cmd.kind == "__exit_ok" is return end
+    if cmd.kind == "error"     is output::error(cmd.error_msg) ; ok = false end
+    if cmd.kind == "help"      is cliapp::print_help() end
+    if cmd.kind == "version"   is output::version_info() end
+    if cmd.kind == "search"    is ok = cmd_search::run(cmd.query, cmd.json) end
+    if cmd.kind == "install"   is ok = cmd_install::run(cmd.packages, cmd.no_env) end
+    if cmd.kind == "remove"    is ok = cmd_remove::run(cmd.packages, cmd.force) end
+    if cmd.kind == "update"    is ok = cmd_update::run(cmd.packages) end
+    if cmd.kind == "upgrade"   is ok = cmd_upgrade::run() end
+    if cmd.kind == "unpack"    is ok = cmd_unpack::run() end
+    if cmd.kind == "check"     is ok = cmd_check::run() end
+    if cmd.kind == "info"      is ok = cmd_info::run(cmd.package) end
+    if cmd.kind == "list"      is ok = cmd_list::run(cmd.installed, cmd.json) end
+    if cmd.kind == "env"       is ok = cmd_env::run(cmd.sub, cmd.yes) end
+    if cmd.kind == "doctor"    is ok = cmd_doctor::run() end
+    if cmd.kind == "clean"     is ok = cmd_clean::run() end
+    if cmd.kind == "rollback"  is ok = cmd_rollback::run(cmd.generation) end
+    if cmd.kind == "pin"       is ok = cmd_pin::run(cmd.package, cmd.version_arg) end
+    if cmd.kind == "unpin"     is ok = cmd_unpin::run(cmd.package) end
+    if cmd.kind == "which"     is ok = cmd_which::run(cmd.package) end
+    if cmd.kind == "gc"        is ok = cmd_gc::run() end
+
+    if !ok is
+        exit(1)
+    end
+end
