@@ -1,0 +1,47 @@
+use "std -> test"    from "test"
+use "std -> strings" from "str"
+
+mod util is
+
+    pub fn split_name_version(s: string) -> [string] is
+        let n: int = s.len()
+        let mut split_at: int = -1
+        let mut i: int = n - 1
+        while i >= 1 is
+            let prev: string = s[i - 1..i]
+            let cur:  string = s[i..i + 1]
+            if prev == "-" && str::is_numeric(cur) is
+                split_at = i - 1
+                break
+            end
+            i = i - 1
+        end
+
+        if split_at >= 0 is
+            return [s[0..split_at], s[split_at + 1..n]]
+        end
+        return [s, ""]
+    end
+
+end
+
+#[test]
+fn splits_simple_name_version() is
+    let r: [string] = util::split_name_version("ripgrep-14.1.1")
+    assert_eq(r[0], "ripgrep")
+    assert_eq(r[1], "14.1.1")
+end
+
+#[test]
+fn no_version_returns_whole_string() is
+    let r: [string] = util::split_name_version("noversion")
+    assert_eq(r[0], "noversion")
+    assert_eq(r[1], "")
+end
+
+#[test]
+fn handles_dashes_inside_name() is
+    let r: [string] = util::split_name_version("python3.11-requests-2.31.0")
+    assert_eq(r[0], "python3.11-requests")
+    assert_eq(r[1], "2.31.0")
+end
