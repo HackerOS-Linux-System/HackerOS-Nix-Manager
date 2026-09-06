@@ -1,1 +1,14 @@
+[package]
+-> name        => hnm
+-> version     => 0.2.0
+-> description => 
+-> author      => HackerOS Team <hackeros068@gmail.com>
+-> license     => Apache-2.0
 
+[build]
+-> lang     => h#
+-> entry    => src/main.h#
+-> output   => build/hnm
+-> emit     => bin
+-> flags    => --release
+-> mem-mode => safety
