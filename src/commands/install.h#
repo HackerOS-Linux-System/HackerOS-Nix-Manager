@@ -1,0 +1,134 @@
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+use "std -> time"    from "time"
+
+mod cmd_install is
+
+    fn strip_nixpkgs_prefix(s: string) -> string is
+        if str::index_of(s, "nixpkgs.") == 0 is return s[8..s.len()] end
+        if str::index_of(s, "nixpkgs#") == 0 is return s[8..s.len()] end
+        return s
+    end
+
+    pub fn run(packages: [string], no_env: bool) -> bool is
+        if packages.len() == 0 is
+            output::error("usage: hnm install <package> [<package>...]")
+            return false
+        end
+
+        if !nix::ensure_nix() is return false end
+        nix::ensure_nixpkgs_config()
+        output::header("Installing " + to_string(packages.len()) + " package(s)")
+
+        let mut failed: [string] = []
+
+        let mut idx: int = 0
+        while idx < packages.len() is
+            let pkg_name: string = packages[idx]
+            write("")
+            output::step(to_string(idx + 1) + "/" + to_string(packages.len()), "installing  " + pkg_name)
+
+            if state::is_installed(pkg_name) is
+                output::warn("'" + pkg_name + "' is already installed \xe2\x80\x94 skipping")
+                idx = idx + 1
+            else is
+                let bare: string = strip_nixpkgs_prefix(pkg_name)
+
+                let task: progress::TaskProgress = progress::task(100, "nix-env -iA nixpkgs." + bare)
+                progress::log(task, "nix-env -iA nixpkgs." + bare + "  [NIXPKGS_ALLOW_UNFREE=1]")
+                progress::set_msg(task, "installing nixpkgs." + bare + " ...")
+
+                let ok: bool = nix::install(bare, task)
+                progress::inc(task, 90)
+
+                if ok is
+                    ;; same nix-env -qa lookup for version *and* description
+                    let info: nix::Pkg = nix::info(bare)
+                    let mut version: string = "?"
+                    let mut description: string = ""
+                    if info.name != "" is
+                        version = info.version
+                        description = info.description
+                    end
+
+                    let pkg: state::InstalledPkg = state::InstalledPkg {
+                        name: pkg_name, version: version,
+                        attr_path: "nixpkgs." + bare,
+                        installed_at: time::now_unix(),
+                        pinned: "", description: description,
+                    }
+                    state::add(pkg)
+                    progress::inc(task, 10)
+                    progress::finish_ok(task, pkg_name + " " + version)
+                else is
+                    progress::finish_err(task, "install failed")
+                    failed.push(pkg_name)
+                end
+                idx = idx + 1
+            end
+        end
+
+        write("")
+        if failed.len() > 0 is
+            output::warn(to_string(failed.len()) + " package(s) failed")
+            output::error("failed: " + str::join(failed, ", "))
+            return false
+        end
+
+        output::ok("all packages installed successfully")
+
+        let gen: int = nix::current_generation()
+        if gen >= 0 is state::set_generation(gen) end
+
+        let cfg: config::HnmConfig = config::load()
+        if cfg.max_generations > 0 is
+            let task: progress::TaskProgress = progress::task(1, "pruning old generations")
+            let n: int = nix::prune_old_generations(cfg.max_generations, task)
+            if n > 0 is
+                output::dim("pruned " + to_string(n) + " old generation(s) (max_generations = " + to_string(cfg.max_generations) + ")")
+            end
+        end
+
+        if !no_env is
+            write("")
+            let profile_bin: string = path::join(config::profile_dir(), "bin")
+            let default_bin: string = path::join(path::join(config::home(), ".nix-profile"), "bin")
+
+            output::info("To use installed packages, add to your ~/.zshrc or ~/.bashrc:")
+            write("")
+            write("  export PATH=\"" + profile_bin + ":$PATH\"")
+
+            let nix_sh: string = shellrc::find_nix_sh()
+            if nix_sh != "" is
+                write("  . '" + nix_sh + "'")
+            else is
+                write("  [ -f ~/.nix-profile/etc/profile.d/nix.sh ] && \\")
+                write("      . ~/.nix-profile/etc/profile.d/nix.sh")
+            end
+
+            write("")
+            output::dim("Then reload: source ~/.zshrc  (or open a new terminal)")
+            output::dim("Tip: `hnm env activate --yes` patches these files for you automatically.")
+
+            let mut pi: int = 0
+            while pi < packages.len() is
+                let bare: string = strip_nixpkgs_prefix(packages[pi])
+                let in_hnm: bool = fs::exists(path::join(profile_bin, bare))
+                let in_default: bool = fs::exists(path::join(default_bin, bare))
+                if in_hnm is
+                    output::dim("  found: " + path::join(profile_bin, bare))
+                else is
+                    if in_default is
+                        output::dim("  found in default profile: " + path::join(default_bin, bare))
+                        output::dim("  also add: export PATH=\"" + default_bin + ":$PATH\"")
+                    end
+                end
+                pi = pi + 1
+            end
+        end
+
+        return true
+    end
+
+end
