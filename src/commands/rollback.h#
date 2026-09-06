@@ -1,0 +1,72 @@
+use "std -> conv" from "conv"
+use "std -> fmt"  from "fmt"
+
+mod cmd_rollback is
+
+    pub fn run(generation: int) -> bool is
+        if !nix::ensure_nix() is return false end
+        output::header("Rollback")
+
+        let gens: [[string]] = nix::list_generations()
+        if gens.len() == 0 is
+            output::error("no generations found in profile")
+            return false
+        end
+
+        output::dim("Available generations:")
+        let mut i: int = 0
+        while i < gens.len() is
+            let mut marker: string = ""
+            if gens[i][2] == "true" is marker = "  \xe2\x86\x90 current" end
+            output::dim("  gen " + fmt::pad_left(gens[i][0], 4) + "   " + gens[i][1] + marker)
+            i = i + 1
+        end
+        write("")
+
+        let mut target: int = generation
+        if target < 0 is
+            let mut current_idx: int = -1
+            let mut j: int = 0
+            while j < gens.len() is
+                if gens[j][2] == "true" is current_idx = j end
+                j = j + 1
+            end
+            if current_idx > 0 is
+                target = conv::str_to_int(gens[current_idx - 1][0])
+            else is
+                output::error("cannot determine previous generation")
+                return false
+            end
+        end
+
+        let mut exists: bool = false
+        let mut k: int = 0
+        while k < gens.len() is
+            if conv::str_to_int(gens[k][0]) == target is exists = true end
+            k = k + 1
+        end
+        if !exists is
+            output::error("generation " + to_string(target) + " does not exist")
+            return false
+        end
+
+        let task: progress::TaskProgress = progress::task(100, "switching to generation " + to_string(target))
+        progress::log(task, "nix-env --switch-generation " + to_string(target))
+        let ok: bool = nix::switch_generation(target, task)
+        if !ok is return false end
+        progress::finish_ok(task, "rolled back to generation " + to_string(target))
+
+        state::set_generation(target)
+        let profile_pkgs: [nix::Pkg] = nix::list_profile()
+        let sync: [int] = state::sync_from_profile(profile_pkgs)
+        if sync[0] > 0 || sync[1] > 0 is
+            output::dim("resynced tracked packages (" + to_string(sync[0]) + " added, " + to_string(sync[1]) + " removed)")
+        end
+
+        write("")
+        output::ok("now at generation " + to_string(target))
+        output::dim("Run `hnm list -i` to see current packages.")
+        return true
+    end
+
+end
