@@ -1,0 +1,33 @@
+use "std -> path"    from "path"
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+
+mod cmd_which is
+
+    pub fn run(package: string) -> bool is
+        let profile_bin: string = path::join(path::join(config::profile_dir(), "bin"), package)
+
+        if fs::exists(profile_bin) is
+            output::ok(profile_bin)
+            return true
+        end
+
+        let r = proc_run_cmd("which " + util::shell_quote(package) + " 2>/dev/null", 10)
+        if r.exit_code == 0 is
+            output::ok(str::trim(r.stdout))
+            return true
+        end
+
+        if state::is_installed(package) is
+            let bin_dir: string = path::join(config::profile_dir(), "bin")
+            output::warn("'" + package + "' is installed but its binary was not found in " + bin_dir)
+            output::dim("The package may provide binaries under different names.")
+            output::dim("Check: ls " + bin_dir)
+            return true
+        end
+
+        output::error("'" + package + "' is not installed \xe2\x80\x94 run `hnm install " + package + "`")
+        return false
+    end
+
+end
