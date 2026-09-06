@@ -1,0 +1,115 @@
+use "std -> strings" from "str"
+
+mod cmd_remove is
+
+    pub fn run(packages: [string], force: bool) -> bool is
+        if packages.len() == 0 is
+            output::error("usage: hnm remove <package> [<package>...]")
+            return false
+        end
+        if !nix::ensure_nix() is return false end
+        output::header("Removing " + to_string(packages.len()) + " package(s)")
+
+        let st: state::State = state::load()
+        let mut to_remove: [string] = []
+        let mut skipped_pinned: [string] = []
+        let mut not_installed: [string] = []
+
+        let mut i: int = 0
+        while i < packages.len() is
+            let pkg_name: string = packages[i]
+            let mut idx: int = -1
+            let mut j: int = 0
+            while j < st.installed.len() is
+                if st.installed[j].name == pkg_name is idx = j end
+                j = j + 1
+            end
+            if idx < 0 is
+                not_installed.push(pkg_name)
+            else is
+                if st.installed[idx].pinned != "" && !force is
+                    skipped_pinned.push(pkg_name)
+                else is
+                    to_remove.push(pkg_name)
+                end
+            end
+            i = i + 1
+        end
+
+        let mut ni: int = 0
+        while ni < not_installed.len() is
+            output::warn("'" + not_installed[ni] + "' is not installed \xe2\x80\x94 skipping")
+            ni = ni + 1
+        end
+        let mut pi: int = 0
+        while pi < skipped_pinned.len() is
+            output::warn("'" + skipped_pinned[pi] + "' is pinned \xe2\x80\x94 use --force to remove it anyway")
+            pi = pi + 1
+        end
+
+        if to_remove.len() == 0 is
+            output::info("nothing to remove")
+            return true
+        end
+
+        if !force is
+            write("")
+            output::info("about to remove: " + str::join(to_remove, ", "))
+            if !output::confirm("Proceed?") is
+                output::warn("aborted \xe2\x80\x94 nothing was removed")
+                return true
+            end
+        end
+
+        let mut failed: [string] = []
+
+        let mut ri: int = 0
+        while ri < to_remove.len() is
+            let pkg_name: string = to_remove[ri]
+            write("")
+            output::step(to_string(ri + 1) + "/" + to_string(to_remove.len()), "removing  " + pkg_name)
+
+            let task: progress::TaskProgress = progress::task(100, "removing " + pkg_name)
+            let ok: bool = nix::remove(pkg_name, task)
+            progress::inc(task, 90)
+
+            if ok is
+                state::remove(pkg_name)
+                progress::inc(task, 10)
+                progress::finish_ok(task, "removed " + pkg_name)
+            else is
+                progress::finish_err(task, "remove failed")
+                failed.push(pkg_name)
+            end
+            ri = ri + 1
+        end
+
+        write("")
+        if failed.len() > 0 is
+            output::error("failed to remove: " + str::join(failed, ", "))
+            return false
+        end
+
+        output::ok("done")
+
+        let gen: int = nix::current_generation()
+        if gen >= 0 is state::set_generation(gen) end
+
+        let cfg: config::HnmConfig = config::load()
+        if cfg.max_generations > 0 is
+            let task2: progress::TaskProgress = progress::task(1, "pruning old generations")
+            let n: int = nix::prune_old_generations(cfg.max_generations, task2)
+            if n > 0 is
+                output::dim("pruned " + to_string(n) + " old generation(s) (max_generations = " + to_string(cfg.max_generations) + ")")
+            end
+        end
+        if cfg.auto_gc is
+            output::info("auto_gc is enabled in config.hk \xe2\x80\x94 running `hnm gc`...")
+            let task3: progress::TaskProgress = progress::task(100, "nix-store --gc")
+            nix::gc(task3)
+        end
+
+        return true
+    end
+
+end
