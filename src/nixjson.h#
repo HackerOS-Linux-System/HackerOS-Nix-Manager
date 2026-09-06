@@ -1,0 +1,117 @@
+use "std -> strings" from "str"
+
+mod nixjson is
+
+    ;; Extract the string value of "key":"value" from a flat-ish JSON
+    ;; text, tolerating an optional space after the colon. "" if absent
+    ;; or if the field isn't a plain string (e.g. it's `null`).
+    pub fn field(text: string, key: string) -> string is
+        let needle_tight: string = "\"" + key + "\":\""
+        let needle_space: string = "\"" + key + "\": \""
+
+        let mut start: int = str::index_of(text, needle_tight)
+        let mut skip: int = needle_tight.len()
+        if start < 0 is
+            start = str::index_of(text, needle_space)
+            skip = needle_space.len()
+        end
+        if start < 0 is return "" end
+
+        let from: int = start + skip
+        let n: int = text.len()
+        let mut i: int = from
+        let mut out: string = ""
+        while i < n is
+            let ch: string = text[i..i + 1]
+            if ch == "\\" && i + 1 < n is
+                let nxt: string = text[i + 1..i + 2]
+                if nxt == "\"" is
+                    out = out + "\""
+                    i = i + 2
+                else is
+                    if nxt == "\\" is
+                        out = out + "\\"
+                        i = i + 2
+                    else is
+                        out = out + ch
+                        i = i + 1
+                    end
+                end
+            else is
+                if ch == "\"" is
+                    return out
+                end
+                out = out + ch
+                i = i + 1
+            end
+        end
+        return out
+    end
+
+    ;; Extract the raw text of a nested object value: "key":{ ... },
+    ;; with balanced-brace matching. "" if absent.
+    pub fn object_field(text: string, key: string) -> string is
+        let needle: string = "\"" + key + "\":{"
+        let start: int = str::index_of(text, needle)
+        if start < 0 is return "" end
+
+        let n: int = text.len()
+        let mut i: int = start + needle.len() - 1 ;; index of the opening '{'
+        let mut depth: int = 0
+        let mut out: string = ""
+        while i < n is
+            let ch: string = text[i..i + 1]
+            out = out + ch
+            if ch == "{" is depth = depth + 1 end
+            if ch == "}" is
+                depth = depth - 1
+                if depth == 0 is return out end
+            end
+            i = i + 1
+        end
+        return out
+    end
+
+    ;; Whether `field(text, key)` would find anything (string OR nested
+    ;; object) for `key`.
+    pub fn has_field(text: string, key: string) -> bool is
+        if str::index_of(text, "\"" + key + "\":\"") >= 0 is return true end
+        if str::index_of(text, "\"" + key + "\": \"") >= 0 is return true end
+        if str::index_of(text, "\"" + key + "\":{") >= 0 is return true end
+        return false
+    end
+
+    ;; nix-env's `--query --available -A <attr> --json` output shape is
+    ;; `{"<attrPath>": { ...fields... }}` — a single-entry object keyed
+    ;; by the attribute path we asked for. Returns [attrPath, bodyText].
+    pub fn unwrap_single_entry(text: string) -> [string] is
+        let trimmed: string = str::trim(text)
+        if trimmed.len() < 2 is return ["", ""] end
+        let inner: string = trimmed[1..trimmed.len() - 1] ;; strip outer { }
+
+        ;; find the first top-level "key":{ ... and take everything up
+        ;; to its matching close brace as the body
+        let colon_brace: int = str::index_of(inner, "\":{")
+        if colon_brace < 0 is return ["", ""] end
+        let key: string = inner[1..colon_brace]
+
+        let mut i: int = colon_brace + 2 ;; at the '{'
+        let n: int = inner.len()
+        let mut depth: int = 0
+        let mut body: string = ""
+        while i < n is
+            let ch: string = inner[i..i + 1]
+            body = body + ch
+            if ch == "{" is depth = depth + 1 end
+            if ch == "}" is
+                depth = depth - 1
+                if depth == 0 is
+                    return [key, body]
+                end
+            end
+            i = i + 1
+        end
+        return [key, ""]
+    end
+
+end
