@@ -1,0 +1,25 @@
+mod cmd_pin is
+
+    pub fn run(package: string, version_arg: string) -> bool is
+        if !nix::ensure_nix() is return false end
+
+        if !state::is_installed(package) is
+            output::error("'" + package + "' is not installed \xe2\x80\x94 install it first with `hnm install " + package + "`")
+            return false
+        end
+
+        let mut pin_ver: string = version_arg
+        if pin_ver == "" is
+            let p: state::InstalledPkg = state::get(package)
+            pin_ver = "?"
+            if p.name != "" is pin_ver = p.version end
+        end
+
+        state::pin(package, pin_ver)
+
+        output::ok("pinned '" + package + "' to version '" + pin_ver + "'")
+        output::dim("Pinned packages will not be updated by `hnm update`.")
+        return true
+    end
+
+end
