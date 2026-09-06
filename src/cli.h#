@@ -1,0 +1,264 @@
+use "std -> env"     from "env"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+use "std -> fmt"     from "fmt"
+
+mod cliapp is
+
+    struct CliCommand is
+        pub kind:        string ;; "search" | "install" | ... | "help" | "version" | "error"
+        pub error_msg:    string ;; populated when kind == "error"
+
+        pub query:        string ;; search
+        pub json:         bool   ;; search, list
+        pub packages:     [string] ;; install, remove, update
+        pub no_env:       bool   ;; install
+        pub force:        bool   ;; remove
+        pub package:      string ;; info, pin, unpin, which
+        pub installed:    bool   ;; list
+        pub sub:          string ;; env
+        pub yes:          bool   ;; env
+        pub generation:   int    ;; rollback (-1 == none given)
+        pub version_arg:  string ;; pin ("" == none given)
+    end
+
+    fn err(msg: string) -> CliCommand is
+        return blank_cmd_with("error", msg)
+    end
+
+    fn blank_cmd_with(kind: string, error_msg: string) -> CliCommand is
+        return CliCommand {
+            kind: kind, error_msg: error_msg,
+            query: "", json: false, packages: [], no_env: false, force: false,
+            package: "", installed: false, sub: "", yes: false,
+            generation: -1, version_arg: "",
+        }
+    end
+
+    fn blank_cmd(kind: string) -> CliCommand is
+        return blank_cmd_with(kind, "")
+    end
+
+    ;; Parse argv (excluding argv[0]) into a CliCommand. On malformed
+    ;; input, returns kind == "error" with error_msg set — callers
+    ;; print it via output::error and exit 1, exactly like the
+    ;; original's `Result<Opts>` did via `main`'s `Err(e)` arm.
+    pub fn parse() -> CliCommand is
+        let argv: [string] = env::args()
+        ;; argv[0] is the program path — real args start at index 1
+        let mut args: [string] = []
+        let mut i: int = 1
+        while i < argv.len() is
+            args.push(argv[i])
+            i = i + 1
+        end
+
+        if args.len() == 0 is
+            print_help()
+            return blank_cmd("__exit_ok")
+        end
+
+        let subcmd: string = args[0]
+        if subcmd == "--help" || subcmd == "-h" is return blank_cmd("help") end
+        if subcmd == "--version" || subcmd == "-V" is return blank_cmd("version") end
+
+        let rest: [string] = args[1..args.len()]
+
+        if subcmd == "search" is
+            let mut query: string = ""
+            let mut json: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--json" is json = true
+                else is
+                    if query == "" is query = a
+                    else is return err("unexpected argument: " + a) end
+                end
+                j = j + 1
+            end
+            if query == "" is return err("usage: hnm search <query> [--json]") end
+            let mut c: CliCommand = blank_cmd("search")
+            c.query = query
+            c.json = json
+            return c
+        end
+
+        if subcmd == "install" || subcmd == "i" is
+            let mut packages: [string] = []
+            let mut no_env: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--no-env" is no_env = true else is packages.push(a) end
+                j = j + 1
+            end
+            if packages.len() == 0 is return err("usage: hnm install <package> [<package>...]") end
+            let mut c: CliCommand = blank_cmd("install")
+            c.packages = packages
+            c.no_env = no_env
+            return c
+        end
+
+        if subcmd == "remove" || subcmd == "rm" || subcmd == "uninstall" is
+            let mut packages: [string] = []
+            let mut force: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--force" || a == "-f" is force = true else is packages.push(a) end
+                j = j + 1
+            end
+            if packages.len() == 0 is return err("usage: hnm remove <package> [<package>...]") end
+            let mut c: CliCommand = blank_cmd("remove")
+            c.packages = packages
+            c.force = force
+            return c
+        end
+
+        if subcmd == "update" || subcmd == "up" is
+            let mut c: CliCommand = blank_cmd("update")
+            c.packages = rest
+            return c
+        end
+
+        if subcmd == "upgrade" is return blank_cmd("upgrade") end
+        if subcmd == "unpack"  is return blank_cmd("unpack") end
+        if subcmd == "check"   is return blank_cmd("check") end
+
+        if subcmd == "info" is
+            if rest.len() == 0 is return err("usage: hnm info <package>") end
+            let mut c: CliCommand = blank_cmd("info")
+            c.package = rest[0]
+            return c
+        end
+
+        if subcmd == "list" || subcmd == "ls" is
+            let mut installed: bool = false
+            let mut json: bool = false
+            let mut j: int = 0
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--installed" || a == "-i" is installed = true
+                else is
+                    if a == "--json" is json = true
+                    else is return err("unexpected argument: " + a) end
+                end
+                j = j + 1
+            end
+            let mut c: CliCommand = blank_cmd("list")
+            c.installed = installed
+            c.json = json
+            return c
+        end
+
+        if subcmd == "env" is
+            if rest.len() == 0 is return err("usage: hnm env <activate|deactivate|status> [--yes]") end
+            let sub: string = rest[0]
+            let mut yes: bool = false
+            let mut j: int = 1
+            while j < rest.len() is
+                let a: string = rest[j]
+                if a == "--yes" || a == "-y" is yes = true else is return err("unexpected argument: " + a) end
+                j = j + 1
+            end
+            let mut c: CliCommand = blank_cmd("env")
+            c.sub = sub
+            c.yes = yes
+            return c
+        end
+
+        if subcmd == "doctor" is return blank_cmd("doctor") end
+        if subcmd == "clean"  is return blank_cmd("clean") end
+
+        if subcmd == "rollback" is
+            let mut c: CliCommand = blank_cmd("rollback")
+            if rest.len() > 0 is
+                if !str::is_numeric(rest[0]) is return err("generation must be a number") end
+                c.generation = conv::str_to_int(rest[0])
+            end
+            return c
+        end
+
+        if subcmd == "pin" is
+            if rest.len() == 0 is return err("usage: hnm pin <package> [<version>]") end
+            let mut c: CliCommand = blank_cmd("pin")
+            c.package = rest[0]
+            if rest.len() > 1 is c.version_arg = rest[1] end
+            return c
+        end
+
+        if subcmd == "unpin" is
+            if rest.len() == 0 is return err("usage: hnm unpin <package>") end
+            let mut c: CliCommand = blank_cmd("unpin")
+            c.package = rest[0]
+            return c
+        end
+
+        if subcmd == "which" is
+            if rest.len() == 0 is return err("usage: hnm which <package>") end
+            let mut c: CliCommand = blank_cmd("which")
+            c.package = rest[0]
+            return c
+        end
+
+        if subcmd == "gc" is return blank_cmd("gc") end
+        if subcmd == "version" || subcmd == "--version" || subcmd == "-V" is return blank_cmd("version") end
+        if subcmd == "help"    || subcmd == "--help"    || subcmd == "-h" is return blank_cmd("help") end
+
+        return err("unknown command '" + subcmd + "'. Run `hnm help` for usage.")
+    end
+
+    fn cyan(s: string)        -> string is return "\x1b[36m" + s + "\x1b[0m" end
+    fn bright_cyan(s: string) -> string is return "\x1b[96m" + s + "\x1b[0m" end
+    fn bright_cyan_bold(s: string) -> string is return "\x1b[1;96m" + s + "\x1b[0m" end
+    fn bold_ul(s: string)     -> string is return "\x1b[1;4;96m" + s + "\x1b[0m" end
+    fn dim(s: string)         -> string is return "\x1b[2m" + s + "\x1b[0m" end
+
+    fn print_cmd_row(name: string, desc: string) is
+        write("  " + bright_cyan(fmt::pad_right(name, name.len() + 26)) + "  " + dim(desc))
+    end
+
+    pub fn print_help() is
+        write("")
+        write("  " + bright_cyan_bold("hnm") + "  " + cyan("HackerOS Nix Manager"))
+        write("  " + dim("v" + HNM_VERSION))
+        write("")
+        write(bold_ul("USAGE"))
+        write("  " + bright_cyan("hnm") + " " + cyan("<command>") + " " + dim("[options]"))
+        write("")
+        write(bold_ul("PACKAGE COMMANDS"))
+        print_cmd_row("search <query>",      "Search nixpkgs for packages")
+        print_cmd_row("install <pkg...>",    "Install one or more packages")
+        print_cmd_row("remove  <pkg...>",    "Remove one or more packages")
+        print_cmd_row("update  [pkg...]",    "Refresh channel and upgrade packages")
+        print_cmd_row("upgrade",             "Upgrade HNM itself (self-update from GitHub releases)")
+        print_cmd_row("info    <pkg>",       "Show package details")
+        print_cmd_row("list    [-i]",        "List available packages, or -i for installed only")
+        print_cmd_row("which   <pkg>",       "Show binary path of a package")
+        print_cmd_row("pin     <pkg> [ver]", "Pin package to a version")
+        print_cmd_row("unpin   <pkg>",       "Unpin a package")
+        print_cmd_row("rollback [gen]",      "Roll back to a previous generation")
+        print_cmd_row("gc",                  "Run Nix garbage collection")
+        write("")
+        write(bold_ul("SYSTEM COMMANDS"))
+        print_cmd_row("unpack",    "Bootstrap Nix (install + configure channel)")
+        print_cmd_row("check",     "Verify Nix installation (nix + nix-env versions)")
+        print_cmd_row("doctor",    "Full system diagnostics")
+        print_cmd_row("env <sub>", "Manage shell profile  [activate|deactivate|status] [-y]")
+        print_cmd_row("clean",     "Remove cached downloads and temp files")
+        print_cmd_row("version",   "Show HNM version info")
+        print_cmd_row("help",      "Show this help")
+        write("")
+        write(bold_ul("FLAGS"))
+        print_cmd_row("--json",            "Output as JSON (search, list)")
+        print_cmd_row("-i / --installed",  "list: show only HNM-tracked installed packages")
+        print_cmd_row("--no-env",          "install: skip the PATH activation hint at the end")
+        print_cmd_row("-f / --force",      "remove: skip the y/N confirmation prompt")
+        print_cmd_row("-y / --yes",        "env: patch/unpatch shell rc files instead of just printing")
+        write("")
+        write("  " + cyan("Docs:") + " " + dim("https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hnm.html"))
+        write("")
+    end
+
+end
