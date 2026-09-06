@@ -1,0 +1,40 @@
+use "std -> strings" from "str"
+
+mod cmd_check is
+
+    pub fn run() -> bool is
+        output::header("Nix installation check")
+
+        let nix_r = proc_run_cmd("nix --version", 10)
+        if nix_r.exit_code == 0 is
+            output::ok("nix        " + str::trim(nix_r.stdout))
+        else is
+            output::warn("nix        NOT FOUND")
+            output::dim("Run `hnm unpack` to install Nix.")
+        end
+
+        let env_r = proc_run_cmd("nix-env --version", 10)
+        if env_r.exit_code == 0 is
+            output::ok("nix-env    " + str::trim(env_r.stdout))
+        else is
+            output::warn("nix-env    NOT FOUND")
+        end
+
+        let chan_r = proc_run_cmd("nix-channel --list", 10)
+        if chan_r.exit_code == 0 is
+            let v: string = str::trim(chan_r.stdout)
+            if v == "" is
+                output::warn("channels   (none registered)")
+                output::dim("Run `hnm unpack` to add nixpkgs-unstable.")
+            else is
+                output::ok("channels   " + str::replace_all(v, "\n", "  |  "))
+            end
+        else is
+            output::warn("nix-channel  NOT FOUND")
+        end
+
+        write("")
+        return true
+    end
+
+end
