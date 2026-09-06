@@ -1,0 +1,100 @@
+use "std -> strings" from "str"
+
+mod progress is
+
+    struct TaskProgress is
+        pub label: string
+    end
+
+    pub fn new_task(total: int, label: string) is
+        write("  " + label + " ...")
+    end
+
+    ;; Kept for signature parity with the original (`TaskProgress::new`);
+    ;; `total` is unused for the same reason `inc` below is a no-op.
+    pub fn task(total: int, label: string) -> TaskProgress is
+        new_task(total, label)
+        return TaskProgress { label: label }
+    end
+
+    pub fn log(t: TaskProgress, msg: string) is
+        write("  \xe2\x94\x82 " + msg)
+    end
+
+    pub fn warn(t: TaskProgress, msg: string) is
+        write("  \xe2\x94\x82 WARN " + msg)
+    end
+
+    pub fn err_line(t: TaskProgress, msg: string) is
+        write("  \xe2\x94\x82 ERR  " + msg)
+    end
+
+    ;; No-op: there is no live bar to update the label/percentage of —
+    ;; see the module doc comment. Kept so call sites don't need
+    ;; special-casing.
+    pub fn set_msg(t: TaskProgress, msg: string) is end
+    pub fn inc(t: TaskProgress, delta: int) is end
+
+    pub fn finish_ok(t: TaskProgress, msg: string) is
+        write("  \xe2\x9c\x93 " + msg)
+    end
+
+    pub fn finish_err(t: TaskProgress, msg: string) is
+        write("  \xe2\x9c\x97 " + msg)
+    end
+
+    ;; Run a pre-assembled shell command line (see util::build_shell_cmd),
+    ;; logging its combined stdout/stderr line-by-line through `t`, and
+    ;; return true iff it exited 0. `timeout_secs <= 0` means unlimited
+    ;; — same convention as the underlying `proc_run_cmd`.
+    pub fn run_cmd_log(t: TaskProgress, shell_cmd: string, timeout_secs: int) -> bool is
+        let result = proc_run_cmd(shell_cmd, timeout_secs)
+
+        if result.stdout.len() > 0 is
+            let lines: [string] = str::split(result.stdout, "\n")
+            let mut i: int = 0
+            while i < lines.len() is
+                if lines[i].len() > 0 is log(t, lines[i]) end
+                i = i + 1
+            end
+        end
+
+        if result.stderr.len() > 0 is
+            let lines: [string] = str::split(result.stderr, "\n")
+            let mut i: int = 0
+            while i < lines.len() is
+                let l: string = lines[i]
+                if l.len() > 0 is
+                    let lc: string = str::to_lower(l)
+                    if str::index_of(lc, "error:") >= 0 || str::index_of(lc, "error") == 0 is
+                        err_line(t, l)
+                    else is
+                        log(t, l)
+                    end
+                end
+                i = i + 1
+            end
+        end
+
+        return result.exit_code == 0
+    end
+
+    ;; Convenience: run a shell string with explicit env vars (compat
+    ;; shim mirroring the original's `run_shell_log_env`).
+    pub fn run_shell_log_env(t: TaskProgress, shell_cmd: string, env_pairs: [string]) -> bool is
+        let full: string = util::build_shell_cmd("sh", ["-c", shell_cmd], env_pairs)
+        return run_cmd_log(t, full, 0)
+    end
+
+    ;; Compatibility shim used by cmd_unpack and others (mirrors the
+    ;; original's `run_with_log_env` / `run_with_log`).
+    pub fn run_with_log_env(t: TaskProgress, program: string, args: [string], env_pairs: [string]) -> bool is
+        let full: string = util::build_shell_cmd(program, args, env_pairs)
+        return run_cmd_log(t, full, 0)
+    end
+
+    pub fn run_with_log(t: TaskProgress, program: string, args: [string]) -> bool is
+        return run_with_log_env(t, program, args, [])
+    end
+
+end
