@@ -3,7 +3,10 @@ fn main() is
     let mut ok: bool = true
 
     if cmd.kind == "__exit_ok" is return end
-    if cmd.kind == "error"     is output::error(cmd.error_msg) ; ok = false end
+    if cmd.kind == "error"     is
+        output::error(cmd.error_msg)
+        ok = false
+    end
     if cmd.kind == "help"      is cliapp::print_help() end
     if cmd.kind == "version"   is output::version_info() end
     if cmd.kind == "search"    is ok = cmd_search::run(cmd.query, cmd.json) end
