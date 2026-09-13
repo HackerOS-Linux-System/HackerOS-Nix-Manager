@@ -14,7 +14,9 @@ pub const HNM_VERSION: string = "0.2"
 pub const HNM_SHELLRC_MARKER: string = "# HNM \xe2\x80\x94 HackerOS Nix Manager"
 pub const HNM_LIST_DEFAULT_ALL_LIMIT: int = 200
 pub const HNM_UPSTREAM_VERSION_URL: string =
+    "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Nix-Manager/main/version.hacker"
 pub const HNM_UPSTREAM_RELEASE_URL: string =
+    "https://github.com/HackerOS-Linux-System/HackerOS-Nix-Manager/releases/download"
 
 ;; ── from util.h# ──────────────────────────────────────
 ;; util.h# — HackerOS Nix Manager (H# port)
@@ -3378,10 +3380,6 @@ end
 ;; original's `Stdio`-inherited `Command::status()` calls didn't fully
 ;; solve either — both rely on the environment's sudo cache.
 
-
-    "https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Nix-Manager/main/version.hacker"
-    "https://github.com/HackerOS-Linux-System/HackerOS-Nix-Manager/releases/download"
-
 mod cmd_upgrade is
 
     fn local_version_file() -> string is
@@ -3579,7 +3577,10 @@ fn main() is
     let mut ok: bool = true
 
     if cmd.kind == "__exit_ok" is return end
-    if cmd.kind == "error"     is output::error(cmd.error_msg) ; ok = false end
+    if cmd.kind == "error"     is
+        output::error(cmd.error_msg)
+        ok = false
+    end
     if cmd.kind == "help"      is cliapp::print_help() end
     if cmd.kind == "version"   is output::version_info() end
     if cmd.kind == "search"    is ok = cmd_search::run(cmd.query, cmd.json) end
