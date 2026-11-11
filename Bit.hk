@@ -1,13 +1,44 @@
 [package]
 -> name        => hnm
 -> version     => 0.2.0
--> description => Wrapper for Nix.
--> author      => HackerOS Team <hackeros068@gmail.com>
+-> description => Wrapper for Nix — a lightweight package manager for HackerOS driving a dedicated nix-env profile.
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
 -> license     => Apache-2.0
+-> lang        => h#
+-> readme      => README.md
+-> repository  => https://github.com/HackerOS-Linux-System/HackerOS-Nix-Manager
+-> keywords    => [nix, package-manager, hackeros, cli]
+
+[edition]
+-> edition   => 2026
+-> toolchain => 1.0
+
+[layout]
+-> src      => src
+-> entry    => src/main.h#
+-> tests    => tests
 
 [build]
--> lang     => h#
--> entry    => src/main.h#
--> output   => build/hnm
--> emit     => bin
+-> link     => static
+-> target   => h#
 -> mem-mode => safety
+
+[default-build]
+-> profile => release
+-> target  => h#
+-> emit    => bin
+
+[commands]
+-> check
+--> run         => bit check
+--> description => Type-check every module without producing a binary
+-> install-local
+--> run         => install -Dm755 cache/build/release/hnm /usr/bin/hnm
+--> description => Install the release binary to /usr/bin/hnm
+-> bootstrap-nix
+--> run         => hl run install-nix.hl
+--> description => Install Nix (only needed outside HackerOS)
+
+[hooks]
+-> pre-build  => echo "building hnm (static, safety mem-mode)"
+-> post-build => echo "hnm built: cache/build/release/hnm"
