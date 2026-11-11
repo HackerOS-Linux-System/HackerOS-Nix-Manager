@@ -205,10 +205,18 @@ mod state is
         return true
     end
 
+    ;; Typed comparator: a `|p: any|` lambda cannot access `.name` (the C++ backend has no
+    ;; struct type to dereference), and `sort_by_key` compares string keys by pointer.
+    fn cmp_installed_name(a: InstalledPkg, b: InstalledPkg) -> int is
+        if a.name < b.name is return -1 end
+        if a.name > b.name is return 1 end
+        return 0
+    end
+
     pub fn list() -> [InstalledPkg] is
         let st: State = load()
         let mut v: [InstalledPkg] = st.installed
-        sort::sort_by_key(v, |p: any| -> any is return p.name end)
+        sort::sort_by(v, cmp_installed_name)
         return v
     end
 
