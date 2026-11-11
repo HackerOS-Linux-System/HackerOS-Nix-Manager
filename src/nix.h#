@@ -16,6 +16,21 @@ mod nix is
         pub license:     string ;; "" == None
     end
 
+    ;; Typed comparators for `sort::sort_by` (see state's cmp_installed_name for why).
+    fn cmp_pkg_name(a: Pkg, b: Pkg) -> int is
+        if a.name < b.name is return -1 end
+        if a.name > b.name is return 1 end
+        return 0
+    end
+
+    fn cmp_generation_id(a: [string], b: [string]) -> int is
+        let x: int = conv::str_to_int(a[0])
+        let y: int = conv::str_to_int(b[0])
+        if x < y is return -1 end
+        if x > y is return 1 end
+        return 0
+    end
+
     ;; ── presence checks ─────────────────────────────────────────────
 
     pub fn nix_ok() -> bool is
@@ -326,7 +341,7 @@ mod nix is
             end
         end
 
-        sort::sort_by_key(pkgs, |p: any| -> any is return p.name end)
+        sort::sort_by(pkgs, cmp_pkg_name)
         return pkgs
     end
 
@@ -402,7 +417,7 @@ mod nix is
         let mut gens: [[string]] = list_generations()
         if gens.len() <= keep is return 0 end
 
-        sort::sort_by_key(gens, |g: any| -> any is return conv::str_to_int(g[0]) end)
+        sort::sort_by(gens, cmp_generation_id)
 
         let cutoff: int = gens.len() - keep
         let mut to_delete: [string] = []
