@@ -65,16 +65,20 @@ hnm doctor
 
 ## Building from source
 
+`hnm` is written in **H#** and built with [`bit`](https://github.com/HackerOS-Linux-System/bit)
+(manifest: [`Bit.hk`](Bit.hk)).
+
 ```sh
-hl run build.hl
-# equivalent to:
-#   cd source-code && cargo build --release
+bit                 # [default-build]: release binary -> cache/build/release/hnm
+bit check           # syntax + type check only
+bit test            # unit tests (tests/util_test.h#)
+bit install-local   # install cache/build/release/hnm to /usr/bin/hnm
+# or: hl run build.hl
 ```
 
-`hnm` needs **Rust ≥ 1.85** (see `rust-version` in `source-code/Cargo.toml`).
-That requirement comes from `hk-parser`'s `clap`-based CLI companion binary,
-which needs edition-2024 support in the toolchain — `hnm`'s own code stays
-on edition 2021. If you don't have Nix yet:
+Requirements: `bit` ≥ 0.3, the H# toolchain ≥ 0.9 (`[edition] -> toolchain` in `Bit.hk`;
+`bit` downloads it only when none is installed) and `g++` (H# compiles through C++).
+If you don't have Nix yet:
 
 ```sh
 hl run install-nix.hl
